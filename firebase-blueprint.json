@@ -1,0 +1,249 @@
+{
+  "entities": {
+    "UserSettings": {
+      "title": "UserSettings",
+      "description": "User workspace risk configuration and capital baseline stored per authenticated user.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Authenticated Firebase user UID matching document ID.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Optional public display name for the cockpit workspace.",
+          "maxLength": 100
+        },
+        "totalCapitalCny": {
+          "type": "number",
+          "description": "Total trading capital denominated in CNY."
+        },
+        "stockRiskPct": {
+          "type": "number",
+          "description": "Maximum per-trade stock stop-loss percentage of capital."
+        },
+        "optionRiskPct": {
+          "type": "number",
+          "description": "Maximum per-trade option premium percentage of capital."
+        },
+        "atrMultiplier": {
+          "type": "number",
+          "description": "ATR stop-loss distance multiplier."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server last update timestamp."
+        }
+      },
+      "required": [
+        "uid",
+        "totalCapitalCny",
+        "stockRiskPct",
+        "optionRiskPct",
+        "atrMultiplier",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "WatchlistItem": {
+      "title": "WatchlistItem",
+      "description": "Tracked A-Share, HK, or US equity/ETF symbol in the user's multi-market radar.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Owner Firebase UID.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "market": {
+          "type": "string",
+          "enum": ["US", "HK", "CN"],
+          "maxLength": 8
+        },
+        "symbol": {
+          "type": "string",
+          "maxLength": 24,
+          "pattern": "^[A-Za-z0-9.\\-]+$"
+        },
+        "lotSize": {
+          "type": "number",
+          "description": "Minimum board lot size for position sizing."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "market", "symbol", "lotSize", "createdAt"]
+    },
+    "LedgerItem": {
+      "title": "LedgerItem",
+      "description": "Futu or broker equity/option holding entry with unified CNY valuation and expiry tracking.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Owner Firebase UID.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "market": {
+          "type": "string",
+          "enum": ["A股", "港股", "美股", "美股期权", "港股期权"],
+          "maxLength": 16
+        },
+        "symbol": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "currency": {
+          "type": "string",
+          "enum": ["CNY", "HKD", "USD"],
+          "maxLength": 8
+        },
+        "quantity": {
+          "type": "number"
+        },
+        "costPrice": {
+          "type": "number"
+        },
+        "expiryDate": {
+          "type": "string",
+          "maxLength": 16,
+          "pattern": "^$|^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "optionRight": {
+          "type": "string",
+          "enum": ["call", "put", ""],
+          "maxLength": 8
+        },
+        "strike": {
+          "type": "number"
+        },
+        "deltaEstimate": {
+          "type": "number"
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "market",
+        "symbol",
+        "currency",
+        "quantity",
+        "costPrice",
+        "expiryDate",
+        "note",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PriceAlert": {
+      "title": "PriceAlert",
+      "description": "Cross-market support and resistance price alert rule synced across devices.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Owner Firebase UID.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "market": {
+          "type": "string",
+          "enum": ["US", "HK", "CN"],
+          "maxLength": 8
+        },
+        "symbol": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24,
+          "pattern": "^[A-Za-z0-9.\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "currency": {
+          "type": "string",
+          "enum": ["CNY", "HKD", "USD"],
+          "maxLength": 8
+        },
+        "supportPrice": {
+          "type": ["number", "null"]
+        },
+        "resistancePrice": {
+          "type": ["number", "null"]
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "triggeredSupportAt": {
+          "type": ["string", "null"],
+          "maxLength": 40
+        },
+        "triggeredResistanceAt": {
+          "type": ["string", "null"],
+          "maxLength": 40
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "market",
+        "symbol",
+        "name",
+        "currency",
+        "enabled",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserSettings" },
+      "description": "Per-user global capital and risk configuration document."
+    },
+    "/users/{userId}/watchlist/{watchId}": {
+      "schema": { "$ref": "#/entities/WatchlistItem" },
+      "description": "Per-user cross-market equity watchlist subcollection."
+    },
+    "/users/{userId}/ledger/{entryId}": {
+      "schema": { "$ref": "#/entities/LedgerItem" },
+      "description": "Per-user Futu/broker stock and option holdings ledger subcollection."
+    },
+    "/users/{userId}/alerts/{alertId}": {
+      "schema": { "$ref": "#/entities/PriceAlert" },
+      "description": "Per-user support/resistance price alert rules subcollection."
+    }
+  }
+}

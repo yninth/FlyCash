@@ -1,0 +1,8 @@
+{
+  "name": "CrossMarket Desk — 跨市场股票与美股期权驾驶舱",
+  "description": "A股、港股、美股三地正股趋势雷达、ATR以损定仓、无未来函数策略回测、美股期权Greeks与到期盈亏模拟器，及金银加密宏观价格看板。",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,0 +1,316 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function hasUserDoc(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId))
+        && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+    }
+
+    function isValidUserSettings(data, userId) {
+      return data.keys().hasAll([
+          'uid',
+          'totalCapitalCny',
+          'stockRiskPct',
+          'optionRiskPct',
+          'atrMultiplier',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'uid',
+          'displayName',
+          'totalCapitalCny',
+          'stockRiskPct',
+          'optionRiskPct',
+          'atrMultiplier',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.uid is string
+        && data.uid.size() >= 1
+        && data.uid.size() <= 128
+        && data.uid.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.uid == userId
+        && data.uid == request.auth.uid
+        && (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 100))
+        && data.totalCapitalCny is number
+        && data.totalCapitalCny >= 10000
+        && data.totalCapitalCny <= 1000000000
+        && data.stockRiskPct is number
+        && data.stockRiskPct >= 0.1
+        && data.stockRiskPct <= 10
+        && data.optionRiskPct is number
+        && data.optionRiskPct >= 0.1
+        && data.optionRiskPct <= 20
+        && data.atrMultiplier is number
+        && data.atrMultiplier >= 0.5
+        && data.atrMultiplier <= 10
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidWatchlistItem(data, userId) {
+      return data.keys().hasAll(['ownerId', 'market', 'symbol', 'lotSize', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'market', 'symbol', 'lotSize', 'createdAt'])
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == userId
+        && data.ownerId == request.auth.uid
+        && data.market is string
+        && data.market.size() <= 8
+        && data.market in ['US', 'HK', 'CN']
+        && data.symbol is string
+        && data.symbol.size() >= 1
+        && data.symbol.size() <= 24
+        && data.symbol.matches('^[A-Za-z0-9.\\-]+$')
+        && data.lotSize is number
+        && data.lotSize >= 1
+        && data.lotSize <= 100000
+        && data.createdAt is timestamp;
+    }
+
+    function isValidLedgerItem(data, userId) {
+      return data.keys().hasAll([
+          'ownerId',
+          'market',
+          'symbol',
+          'currency',
+          'quantity',
+          'costPrice',
+          'expiryDate',
+          'note',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId',
+          'market',
+          'symbol',
+          'currency',
+          'quantity',
+          'costPrice',
+          'expiryDate',
+          'optionRight',
+          'strike',
+          'deltaEstimate',
+          'note',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == userId
+        && data.ownerId == request.auth.uid
+        && data.market is string
+        && data.market.size() <= 16
+        && data.market in ['A股', '港股', '美股', '美股期权', '港股期权']
+        && data.symbol is string
+        && data.symbol.size() >= 1
+        && data.symbol.size() <= 40
+        && data.currency is string
+        && data.currency.size() <= 8
+        && data.currency in ['CNY', 'HKD', 'USD']
+        && data.quantity is number
+        && data.quantity > 0
+        && data.quantity <= 100000000
+        && data.costPrice is number
+        && data.costPrice >= 0
+        && data.costPrice <= 10000000
+        && data.expiryDate is string
+        && data.expiryDate.size() <= 16
+        && data.expiryDate.matches('^$|^\\d{4}-\\d{2}-\\d{2}$')
+        && (!('optionRight' in data) || (data.optionRight is string && data.optionRight.size() <= 8 && data.optionRight in ['call', 'put', '']))
+        && (!('strike' in data) || (data.strike is number && data.strike >= 0 && data.strike <= 1000000))
+        && (!('deltaEstimate' in data) || (data.deltaEstimate is number && data.deltaEstimate >= -1 && data.deltaEstimate <= 1))
+        && data.note is string
+        && data.note.size() <= 200
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidPriceAlert(data, userId) {
+      return data.keys().hasAll([
+          'ownerId',
+          'market',
+          'symbol',
+          'name',
+          'currency',
+          'enabled',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId',
+          'market',
+          'symbol',
+          'name',
+          'currency',
+          'supportPrice',
+          'resistancePrice',
+          'enabled',
+          'triggeredSupportAt',
+          'triggeredResistanceAt',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.ownerId is string
+        && data.ownerId.size() >= 1
+        && data.ownerId.size() <= 128
+        && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.ownerId == userId
+        && data.ownerId == request.auth.uid
+        && data.market is string
+        && data.market.size() <= 8
+        && data.market in ['US', 'HK', 'CN']
+        && data.symbol is string
+        && data.symbol.size() >= 1
+        && data.symbol.size() <= 24
+        && data.symbol.matches('^[A-Za-z0-9.\\-]+$')
+        && data.name is string
+        && data.name.size() <= 80
+        && data.currency is string
+        && data.currency.size() <= 8
+        && data.currency in ['CNY', 'HKD', 'USD']
+        && (!('supportPrice' in data) || data.supportPrice == null || (data.supportPrice is number && data.supportPrice > 0 && data.supportPrice <= 10000000))
+        && (!('resistancePrice' in data) || data.resistancePrice == null || (data.resistancePrice is number && data.resistancePrice > 0 && data.resistancePrice <= 10000000))
+        && data.enabled is bool
+        && (!('triggeredSupportAt' in data) || data.triggeredSupportAt == null || (data.triggeredSupportAt is string && data.triggeredSupportAt.size() <= 40))
+        && (!('triggeredResistanceAt' in data) || data.triggeredResistanceAt == null || (data.triggeredResistanceAt is string && data.triggeredResistanceAt.size() <= 40))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    match /users/{userId} {
+      allow get: if isOwner(userId) && isValidId(userId);
+      allow list: if false;
+      allow create: if isOwner(userId)
+        && isValidId(userId)
+        && isValidUserSettings(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isOwner(userId)
+        && isValidId(userId)
+        && isValidUserSettings(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'displayName',
+          'totalCapitalCny',
+          'stockRiskPct',
+          'optionRiskPct',
+          'atrMultiplier',
+          'updatedAt'
+        ]);
+      allow delete: if false;
+
+      match /watchlist/{watchId} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(watchId) && hasUserDoc(userId);
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(watchId)
+          && isValidWatchlistItem(incoming(), userId)
+          && incoming().createdAt == request.time
+          && hasUserDoc(userId);
+        allow update: if false;
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(watchId) && hasUserDoc(userId);
+      }
+
+      match /ledger/{entryId} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(entryId) && hasUserDoc(userId);
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(entryId)
+          && isValidLedgerItem(incoming(), userId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && hasUserDoc(userId);
+        allow update: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(entryId)
+          && isValidLedgerItem(incoming(), userId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'market',
+            'symbol',
+            'currency',
+            'quantity',
+            'costPrice',
+            'expiryDate',
+            'optionRight',
+            'strike',
+            'deltaEstimate',
+            'note',
+            'updatedAt'
+          ])
+          && hasUserDoc(userId);
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(entryId) && hasUserDoc(userId);
+      }
+
+      match /alerts/{alertId} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(alertId) && hasUserDoc(userId);
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(alertId)
+          && isValidPriceAlert(incoming(), userId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && hasUserDoc(userId);
+        allow update: if isOwner(userId)
+          && isValidId(userId)
+          && isValidId(alertId)
+          && isValidPriceAlert(incoming(), userId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'name',
+            'currency',
+            'supportPrice',
+            'resistancePrice',
+            'enabled',
+            'triggeredSupportAt',
+            'triggeredResistanceAt',
+            'updatedAt'
+          ])
+          && hasUserDoc(userId);
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(alertId) && hasUserDoc(userId);
+      }
+    }
+  }
+}
