@@ -2641,7 +2641,7 @@ async function startServer() {
     });
   }
 
-  const port = Number(process.env.PORT || 3000);
+  const port = Number(process.env.PORT || process.env.SERVER_PORT || 3000);
   app.listen(port, '0.0.0.0', () => {
     console.log(`金钱飘飘 server listening on http://0.0.0.0:${port}`);
   });
