@@ -87,27 +87,184 @@ function cnToYahooSymbol(code: string): string {
   return `${code}.SZ`;
 }
 
-async function fetchEastmoneyKlines(
-  code: string,
-  days: number
-): Promise<{ name: string; bars: OhlcvBar[] } | null> {
+function normalizeHk5Digits(raw: string): string {
+  const cleaned = raw.trim().toUpperCase().replace(/\.HK$/i, '');
+  if (/^\d+$/.test(cleaned)) {
+    return String(parseInt(cleaned, 10)).padStart(5, '0');
+  }
+  return cleaned;
+}
+
+function normalizeUsSymbol(raw: string): string {
+  let cleaned = raw.trim().toUpperCase();
+  cleaned = cleaned.replace(/^(?:US|NASDAQ|NYSE|AMEX|BATS|ARCA)[:.\s]+/i, '');
+  cleaned = cleaned.replace(/\.US$/i, '');
+  const leadingToken = cleaned.match(/^([A-Z]{1,6}(?:[.-][A-Z]{1,2})?)(?:\s+.*)?$/);
+  if (leadingToken) {
+    cleaned = leadingToken[1];
+  }
+  // Yahoo Finance uses hyphen for share classes like BRK-B
+  cleaned = cleaned.replace(/\.([A-Z]{1,2})$/, '-$1');
+  return cleaned;
+}
+
+const US_SECID_PRESETS: Record<string, string> = {
+  NVDA: '105.NVDA',
+  QQQ: '105.QQQ',
+  AAPL: '105.AAPL',
+  TSLA: '105.TSLA',
+  MSFT: '105.MSFT',
+  META: '105.META',
+  AMZN: '105.AMZN',
+  GOOG: '105.GOOG',
+  GOOGL: '105.GOOGL',
+  AMD: '105.AMD',
+  AVGO: '105.AVGO',
+  MU: '105.MU',
+  SNDK: '105.SNDK',
+  INTC: '105.INTC',
+  NFLX: '105.NFLX',
+  PLTR: '105.PLTR',
+  TQQQ: '105.TQQQ',
+  SQQQ: '105.SQQQ',
+  NVDL: '105.NVDL',
+  COIN: '105.COIN',
+  MSTR: '105.MSTR',
+  SPY: '106.SPY',
+  TSM: '106.TSM',
+  BABA: '106.BABA',
+  ORCL: '106.ORCL',
+  SNXX: '107.SNXX',
+  SOXL: '107.SOXL',
+  SOXS: '107.SOXS',
+  GLD: '107.GLD',
+  SLV: '107.SLV',
+  UVXY: '107.UVXY',
+};
+
+export interface EastmoneySuggestItem {
+  market: 'US' | 'HK' | 'CN';
+  symbol: string;
+  name: string;
+  secid: string;
+  exchangeLabel: string;
+}
+
+async function searchEastmoneySuggest(
+  query: string,
+  marketFilter?: string
+): Promise<EastmoneySuggestItem[]> {
+  const q = query.trim();
+  if (!q) return [];
+  const cacheKey = `em_suggest:${q.toUpperCase()}:${(marketFilter || 'ALL').toUpperCase()}`;
+  const cached = getCached<EastmoneySuggestItem[]>(cacheKey);
+  if (cached) return cached;
+
   try {
-    const marketId =
-      code.startsWith('6') || code.startsWith('5') || code.startsWith('9') ? '1' : '0';
-    const secid = `${marketId}.${code}`;
-    const endDt = new Date();
+    const url =
+      `https://searchapi.eastmoney.com/api/suggest/get` +
+      `?input=${encodeURIComponent(q)}&type=14&token=D43BF722C8E33BDC906FB84D85E7EE6E`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
+    const resp = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0',
+        Referer: 'https://quote.eastmoney.com/',
+      },
+    });
+    clearTimeout(timer);
+    if (!resp.ok) return [];
+
+    const json = (await resp.json()) as {
+      QuotationCodeTable?: {
+        Data?: Array<{
+          Code?: string;
+          Name?: string;
+          Classify?: string;
+          SecurityTypeName?: string;
+          JYS?: string;
+          QuoteID?: string;
+        }>;
+      };
+    };
+
+    const rawList = json?.QuotationCodeTable?.Data || [];
+    const results: EastmoneySuggestItem[] = [];
+    const filterUpper = marketFilter?.toUpperCase();
+
+    for (const item of rawList) {
+      const code = String(item.Code || '').trim().toUpperCase();
+      const name = String(item.Name || code).trim();
+      const quoteId = String(item.QuoteID || '').trim();
+      const classify = String(item.Classify || '').trim();
+      if (!code || !quoteId) continue;
+
+      let mkt: 'US' | 'HK' | 'CN' | null = null;
+      if (classify === 'UsStock') mkt = 'US';
+      else if (classify === 'HK') mkt = 'HK';
+      else if (classify === 'AStock' || classify === 'Fund') mkt = 'CN';
+      if (!mkt) continue;
+      if (filterUpper && filterUpper !== 'ALL' && mkt !== filterUpper) continue;
+
+      results.push({
+        market: mkt,
+        symbol: mkt === 'HK' ? code.replace(/^0(?=\d{4}$)/, '') : code,
+        name,
+        secid: quoteId,
+        exchangeLabel: item.SecurityTypeName || item.JYS || mkt,
+      });
+    }
+
+    setCached(cacheKey, results, 10 * 60_000);
+    return results;
+  } catch {
+    return [];
+  }
+}
+
+async function resolveUsTickerViaSearch(query: string): Promise<string | null> {
+  const emHits = await searchEastmoneySuggest(query, 'US');
+  if (emHits.length > 0) {
+    setCached(`us_secid:${emHits[0].symbol}`, emHits[0].secid, 24 * 3600_000);
+    return emHits[0].symbol;
+  }
+  try {
+    const res = await yahooFinance.search(query.trim(), {
+      quotesCount: 8,
+      newsCount: 0,
+    });
+    const quotes = Array.isArray(res?.quotes) ? res.quotes : [];
+    const candidate = quotes.find((q) => {
+      const rec = q as Record<string, unknown>;
+      const qt = String(rec.quoteType || '').toUpperCase();
+      const sym = String(rec.symbol || '').trim();
+      return Boolean(sym) && (qt === 'ETF' || qt === 'EQUITY' || qt === 'INDEX');
+    }) as Record<string, unknown> | undefined;
+    return candidate?.symbol ? String(candidate.symbol).toUpperCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchEastmoneyKlinesBySecid(
+  secid: string,
+  days: number
+): Promise<{ code: string; name: string; bars: OhlcvBar[] } | null> {
+  try {
+    const endDt = new Date(Date.now() + 2 * 24 * 3600 * 1000);
     const startDt = new Date(Date.now() - days * 24 * 3600 * 1000);
     const beg = toIsoDate(startDt).replace(/-/g, '');
     const end = toIsoDate(endDt).replace(/-/g, '');
 
     const url =
       `https://push2his.eastmoney.com/api/qt/stock/kline/get` +
-      `?secid=${secid}&fields1=f1,f2,f3,f4,f5,f6` +
+      `?secid=${encodeURIComponent(secid)}&fields1=f1,f2,f3,f4,f5,f6` +
       `&fields2=f51,f52,f53,f54,f55,f56,f57,f58` +
       `&klt=101&fqt=1&beg=${beg}&end=${end}`;
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 7000);
+    const timer = setTimeout(() => controller.abort(), 4500);
     const resp = await fetch(url, {
       signal: controller.signal,
       headers: {
@@ -119,7 +276,7 @@ async function fetchEastmoneyKlines(
 
     if (!resp.ok) return null;
     const json = (await resp.json()) as {
-      data?: { name?: string; klines?: string[] };
+      data?: { code?: string; name?: string; klines?: string[] };
     };
     const klines = json?.data?.klines;
     if (!Array.isArray(klines) || klines.length === 0) return null;
@@ -137,7 +294,8 @@ async function fetchEastmoneyKlines(
         Number.isFinite(open) &&
         Number.isFinite(close) &&
         Number.isFinite(high) &&
-        Number.isFinite(low)
+        Number.isFinite(low) &&
+        close > 0
       ) {
         bars.push({ date: parts[0], open, high, low, close, volume: volume || 0 });
       }
@@ -145,7 +303,8 @@ async function fetchEastmoneyKlines(
 
     if (bars.length === 0) return null;
     return {
-      name: json.data?.name || code,
+      code: json.data?.code || secid.split('.')[1] || secid,
+      name: json.data?.name || secid,
       bars,
     };
   } catch {
@@ -153,7 +312,551 @@ async function fetchEastmoneyKlines(
   }
 }
 
-interface CnLiveQuote {
+async function resolveAndFetchUsEastmoneyKlines(
+  rawInput: string,
+  days: number
+): Promise<{ symbol: string; name: string; bars: OhlcvBar[] } | null> {
+  const usSym = normalizeUsSymbol(rawInput);
+
+  const cachedSecid = getCached<string>(`us_secid:${usSym}`) || US_SECID_PRESETS[usSym];
+  if (cachedSecid) {
+    const res = await fetchEastmoneyKlinesBySecid(cachedSecid, days);
+    if (res) {
+      setCached(`us_secid:${usSym}`, cachedSecid, 24 * 3600_000);
+      return { symbol: usSym, name: res.name, bars: res.bars };
+    }
+  }
+
+  // Try Eastmoney Suggest API (supports English ticker AND Chinese names like "二倍做多SNDK", "英伟达")
+  const hits = await searchEastmoneySuggest(rawInput, 'US');
+  const exactOrFirst =
+    hits.find((h) => h.symbol === usSym) ||
+    (hits.length > 0 ? hits[0] : null);
+  if (exactOrFirst) {
+    const res = await fetchEastmoneyKlinesBySecid(exactOrFirst.secid, days);
+    if (res) {
+      setCached(`us_secid:${exactOrFirst.symbol}`, exactOrFirst.secid, 24 * 3600_000);
+      return {
+        symbol: exactOrFirst.symbol,
+        name: res.name || exactOrFirst.name,
+        bars: res.bars,
+      };
+    }
+  }
+
+  // Fallback parallel secid market probe (105=NASDAQ, 106=NYSE, 107=AMEX/BATS)
+  if (/^[A-Z]{1,6}(?:-[A-Z]{1,2})?$/.test(usSym)) {
+    const candidates = [`105.${usSym}`, `106.${usSym}`, `107.${usSym}`];
+    const results = await Promise.all(
+      candidates.map(async (secid) => ({
+        secid,
+        res: await fetchEastmoneyKlinesBySecid(secid, days),
+      }))
+    );
+    const hit = results.find((r) => r.res !== null);
+    if (hit && hit.res) {
+      setCached(`us_secid:${usSym}`, hit.secid, 24 * 3600_000);
+      return { symbol: usSym, name: hit.res.name, bars: hit.res.bars };
+    }
+  }
+
+  return null;
+}
+
+interface EastmoneyFundFlowBar {
+  date: string;
+  mainNet: number;
+  superLargeNet: number;
+  largeNet: number;
+  mediumNet: number;
+  smallNet: number;
+  mainPct: number;
+  superLargePct: number;
+  largePct: number;
+  mediumPct: number;
+  smallPct: number;
+  close: number;
+  changePct: number;
+}
+
+async function fetchEastmoneyFundFlowBySecid(
+  secid: string,
+  days = 60
+): Promise<{ name: string; bars: EastmoneyFundFlowBar[] } | null> {
+  try {
+    const lmt = Math.min(120, Math.max(20, days));
+    const url =
+      `https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get` +
+      `?lmt=${lmt}&klt=101&fields1=f1,f2,f3,f7` +
+      `&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65` +
+      `&secid=${encodeURIComponent(secid)}`;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2500);
+    const resp = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        Referer: 'https://data.eastmoney.com/',
+      },
+    });
+    clearTimeout(timer);
+    if (!resp.ok) return null;
+
+    const json = (await resp.json()) as {
+      data?: { name?: string; klines?: string[] };
+    };
+    const klines = json?.data?.klines;
+    if (!Array.isArray(klines) || klines.length === 0) return null;
+
+    const bars: EastmoneyFundFlowBar[] = [];
+    for (const row of klines) {
+      const p = row.split(',');
+      if (p.length < 13) continue;
+      const mainNet = parseFloat(p[1]);
+      const smallNet = parseFloat(p[2]);
+      const mediumNet = parseFloat(p[3]);
+      const largeNet = parseFloat(p[4]);
+      const superLargeNet = parseFloat(p[5]);
+      const mainPct = parseFloat(p[6]);
+      const smallPct = parseFloat(p[7]);
+      const mediumPct = parseFloat(p[8]);
+      const largePct = parseFloat(p[9]);
+      const superLargePct = parseFloat(p[10]);
+      const close = parseFloat(p[11]);
+      const changePct = parseFloat(p[12]);
+
+      if (!Number.isFinite(mainNet) || !Number.isFinite(close)) continue;
+      bars.push({
+        date: p[0],
+        mainNet,
+        superLargeNet: Number.isFinite(superLargeNet) ? superLargeNet : 0,
+        largeNet: Number.isFinite(largeNet) ? largeNet : 0,
+        mediumNet: Number.isFinite(mediumNet) ? mediumNet : 0,
+        smallNet: Number.isFinite(smallNet) ? smallNet : 0,
+        mainPct: Number.isFinite(mainPct) ? mainPct : 0,
+        superLargePct: Number.isFinite(superLargePct) ? superLargePct : 0,
+        largePct: Number.isFinite(largePct) ? largePct : 0,
+        mediumPct: Number.isFinite(mediumPct) ? mediumPct : 0,
+        smallPct: Number.isFinite(smallPct) ? smallPct : 0,
+        close,
+        changePct: Number.isFinite(changePct) ? changePct : 0,
+      });
+    }
+
+    if (bars.length === 0) return null;
+    return {
+      name: (json.data?.name || secid).trim(),
+      bars,
+    };
+  } catch {
+    return null;
+  }
+}
+
+interface SinaMoneyFlowRow {
+  opendate?: string;
+  trade?: string;
+  changeratio?: string;
+  r0?: string;
+  r1?: string;
+  r2?: string;
+  r3?: string;
+  r0_net?: string;
+  r1_net?: string;
+  r2_net?: string;
+  r3_net?: string;
+}
+
+async function fetchSinaCnFundFlow(
+  code6: string,
+  days = 60
+): Promise<EastmoneyFundFlowBar[] | null> {
+  try {
+    const sinaSym = cnToTencentSymbol(code6);
+    const num = Math.min(120, Math.max(20, days));
+    const url =
+      `https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_lscjfb` +
+      `?page=1&num=${num}&sort=opendate&asc=0&daima=${encodeURIComponent(sinaSym)}`;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
+    const resp = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0',
+        Referer: 'https://vip.stock.finance.sina.com.cn/',
+      },
+    });
+    clearTimeout(timer);
+    if (!resp.ok) return null;
+
+    const rows = (await resp.json()) as SinaMoneyFlowRow[];
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+
+    const parsed: EastmoneyFundFlowBar[] = [];
+    for (const r of rows) {
+      const date = String(r.opendate || '').trim();
+      const close = parseFloat(String(r.trade ?? ''));
+      const changeRatio = parseFloat(String(r.changeratio ?? '0'));
+      const r0Net = parseFloat(String(r.r0_net ?? '0')) || 0;
+      const r1Net = parseFloat(String(r.r1_net ?? '0')) || 0;
+      const r2Net = parseFloat(String(r.r2_net ?? '0')) || 0;
+      const r3Net = parseFloat(String(r.r3_net ?? '0')) || 0;
+      const r0 = parseFloat(String(r.r0 ?? '0')) || 0;
+      const r1 = parseFloat(String(r.r1 ?? '0')) || 0;
+      const r2 = parseFloat(String(r.r2 ?? '0')) || 0;
+      const r3 = parseFloat(String(r.r3 ?? '0')) || 0;
+
+      if (!date || !Number.isFinite(close) || close <= 0) continue;
+
+      const superLargeNet = r0Net;
+      const largeNet = r1Net;
+      const mediumNet = r2Net;
+      const smallNet = r3Net;
+      const mainNet = superLargeNet + largeNet;
+      const totalTurnover = Math.max(
+        1,
+        r0 + r1 + r2 + r3,
+        Math.abs(superLargeNet) + Math.abs(largeNet) + Math.abs(mediumNet) + Math.abs(smallNet)
+      );
+
+      parsed.push({
+        date,
+        mainNet,
+        superLargeNet,
+        largeNet,
+        mediumNet,
+        smallNet,
+        mainPct: (mainNet / totalTurnover) * 100,
+        superLargePct: (superLargeNet / totalTurnover) * 100,
+        largePct: (largeNet / totalTurnover) * 100,
+        mediumPct: (mediumNet / totalTurnover) * 100,
+        smallPct: (smallNet / totalTurnover) * 100,
+        close,
+        changePct: Number.isFinite(changeRatio) ? changeRatio * 100 : 0,
+      });
+    }
+
+    if (parsed.length === 0) return null;
+    parsed.sort((a, b) => a.date.localeCompare(b.date));
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+async function computeOhlcvFundFlowFallback(
+  market: 'US' | 'HK' | 'CN',
+  symbol: string,
+  days: number
+): Promise<{
+  symbol: string;
+  name: string;
+  bars: EastmoneyFundFlowBar[];
+  source: string;
+} | null> {
+  try {
+    const stock = (await fetchStockData(market, symbol, Math.max(120, days + 45), {
+      includeExtendedIntraday: false,
+    })) as {
+      symbol: string;
+      name: string;
+      bars: OhlcvBar[];
+    };
+
+    const dailyBars = Array.isArray(stock?.bars) ? stock.bars : [];
+    if (dailyBars.length < 15) return null;
+
+    // Fetch real 15m intraday bars for recent ~10 sessions to separate institutional block bars from small bars
+    const ySym =
+      market === 'HK'
+        ? normalizeHkSymbol(stock.symbol)
+        : market === 'CN'
+          ? cnToYahooSymbol(normalizeCnCode(stock.symbol))
+          : normalizeUsSymbol(stock.symbol);
+
+    const intradayByDate = new Map<
+      string,
+      Array<{ open: number; high: number; low: number; close: number; volume: number }>
+    >();
+    let usedIntraday = false;
+
+    try {
+      const p1 = new Date(Date.now() - 14 * 24 * 3600 * 1000);
+      const chart15m = await withTimeout(
+        yahooFinance.chart(ySym, { period1: p1, interval: '15m' }).catch(() => null),
+        2800,
+        null
+      );
+      for (const q of chart15m?.quotes || []) {
+        if (!q.date || q.close == null || q.high == null || q.low == null || q.volume == null) {
+          continue;
+        }
+        const dt = new Date(q.date);
+        const dateKey = market === 'US' ? formatEtDateAndTime(dt).etDate : toIsoDate(dt);
+        const list = intradayByDate.get(dateKey) || [];
+        list.push({
+          open: Number(q.open ?? q.close),
+          high: Number(q.high),
+          low: Number(q.low),
+          close: Number(q.close),
+          volume: Number(q.volume ?? 0),
+        });
+        intradayByDate.set(dateKey, list);
+      }
+    } catch {
+      // non-fatal, daily Chaikin turnover calculation handles all days
+    }
+
+    const flowBars: EastmoneyFundFlowBar[] = [];
+    for (let i = 0; i < dailyBars.length; i++) {
+      const b = dailyBars[i];
+      const prevClose = i > 0 ? dailyBars[i - 1].close : b.open || b.close;
+      const winStart = Math.max(0, i - 19);
+      const volSlice = dailyBars.slice(winStart, i + 1);
+      const avgVol20 =
+        volSlice.reduce((s, x) => s + Math.max(0, x.volume), 0) / Math.max(1, volSlice.length);
+      const volRatio = avgVol20 > 0 ? b.volume / avgVol20 : 1;
+
+      const typicalPrice = (b.high + b.low + b.close) / 3;
+      const dailyTurnover = Math.max(1, typicalPrice * Math.max(0, b.volume));
+      const changePct = prevClose > 0 ? ((b.close - prevClose) / prevClose) * 100 : 0;
+
+      const intra = intradayByDate.get(b.date);
+      if (intra && intra.length >= 6) {
+        usedIntraday = true;
+        const barTurnovers = intra
+          .map((x) => x.close * Math.max(0, x.volume))
+          .filter((v) => v > 0)
+          .sort((x, y) => x - y);
+        const medianBarTurn =
+          barTurnovers.length > 0
+            ? barTurnovers[Math.floor(barTurnovers.length / 2)]
+            : dailyTurnover / intra.length;
+
+        let superLargeNet = 0;
+        let largeNet = 0;
+        let mediumNet = 0;
+        let smallNet = 0;
+
+        for (let k = 0; k < intra.length; k++) {
+          const m = intra[k];
+          const prevMClose = k > 0 ? intra[k - 1].close : prevClose;
+          const mTurn = m.close * Math.max(0, m.volume);
+          if (mTurn <= 0) continue;
+
+          const rangeM = m.high - m.low;
+          const mfm =
+            rangeM > 1e-6
+              ? ((m.close - m.low) - (m.high - m.close)) / rangeM
+              : m.close >= prevMClose
+                ? 0.4
+                : -0.4;
+          const retSign =
+            prevMClose > 0 ? Math.tanh(((m.close - prevMClose) / prevMClose) * 160) : 0;
+          const signedFlow = mTurn * (0.65 * mfm + 0.35 * retSign);
+
+          if (mTurn >= medianBarTurn * 2.2) {
+            superLargeNet += signedFlow;
+          } else if (mTurn >= medianBarTurn * 1.15) {
+            largeNet += signedFlow;
+          } else if (mTurn >= medianBarTurn * 0.55) {
+            mediumNet += signedFlow;
+          } else {
+            smallNet += signedFlow;
+          }
+        }
+
+        const mainNet = superLargeNet + largeNet;
+        const denom = Math.max(
+          dailyTurnover,
+          intra.reduce((s, m) => s + m.close * Math.max(0, m.volume), 0)
+        );
+        flowBars.push({
+          date: b.date,
+          mainNet,
+          superLargeNet,
+          largeNet,
+          mediumNet,
+          smallNet,
+          mainPct: (mainNet / denom) * 100,
+          superLargePct: (superLargeNet / denom) * 100,
+          largePct: (largeNet / denom) * 100,
+          mediumPct: (mediumNet / denom) * 100,
+          smallPct: (smallNet / denom) * 100,
+          close: b.close,
+          changePct,
+        });
+      } else {
+        const range = b.high - b.low;
+        const mfm =
+          range > 1e-6
+            ? ((b.close - b.low) - (b.high - b.close)) / range
+            : b.close >= prevClose
+              ? 0.35
+              : -0.35;
+        const gapThrust =
+          prevClose > 0 ? Math.tanh(((b.close - prevClose) / prevClose) * 18) : 0;
+        const intensity = 0.72 * mfm + 0.28 * gapThrust;
+        const totalSigned = dailyTurnover * intensity;
+
+        const instShare = Math.min(0.82, Math.max(0.46, 0.58 + 0.16 * Math.tanh(volRatio - 1)));
+        const mainNet = totalSigned * instShare;
+        const superLargeNet = mainNet * 0.62;
+        const largeNet = mainNet * 0.38;
+        const mediumNet = totalSigned * (1 - instShare) * 0.6;
+        const smallNet = totalSigned * (1 - instShare) * 0.4;
+
+        flowBars.push({
+          date: b.date,
+          mainNet,
+          superLargeNet,
+          largeNet,
+          mediumNet,
+          smallNet,
+          mainPct: (mainNet / dailyTurnover) * 100,
+          superLargePct: (superLargeNet / dailyTurnover) * 100,
+          largePct: (largeNet / dailyTurnover) * 100,
+          mediumPct: (mediumNet / dailyTurnover) * 100,
+          smallPct: (smallNet / dailyTurnover) * 100,
+          close: b.close,
+          changePct,
+        });
+      }
+    }
+
+    return {
+      symbol: stock.symbol,
+      name: stock.name,
+      bars: flowBars.slice(-days),
+      source: usedIntraday
+        ? '量化量价资金流 · 15m大单与Chaikin实盘成交额模型'
+        : '量化量价资金流 · Chaikin实盘成交额模型',
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function resolveFundFlowData(
+  market: string,
+  symbol: string,
+  days = 60,
+  forceRefresh = false
+) {
+  const normMarket = market.toUpperCase() as 'US' | 'HK' | 'CN';
+  const cleanSym = symbol.trim().toUpperCase();
+  const cacheKey = `fflow:${normMarket}:${cleanSym}:${days}`;
+  if (!forceRefresh) {
+    const cached = getCached<unknown>(cacheKey);
+    if (cached) return cached;
+  }
+
+  let secid: string | null = null;
+  let resolvedSymbol = cleanSym;
+  let cnCode6 = '';
+
+  if (normMarket === 'CN') {
+    let code = normalizeCnCode(cleanSym);
+    if (!/^\d{6}$/.test(code)) {
+      const hits = await searchEastmoneySuggest(symbol, 'CN');
+      if (hits.length > 0) {
+        code = normalizeCnCode(hits[0].symbol);
+        secid = hits[0].secid;
+      }
+    } else {
+      const marketId =
+        code.startsWith('6') || code.startsWith('5') || code.startsWith('9') ? '1' : '0';
+      secid = `${marketId}.${code}`;
+    }
+    cnCode6 = code;
+    resolvedSymbol = code;
+  } else if (normMarket === 'HK') {
+    let raw = cleanSym;
+    if (!/^\d+$/.test(cleanSym.replace(/\.HK$/i, ''))) {
+      const hits = await searchEastmoneySuggest(symbol, 'HK');
+      if (hits.length > 0) raw = hits[0].symbol;
+    }
+    const code5 = normalizeHk5Digits(raw);
+    secid = `116.${code5}`;
+    resolvedSymbol = code5.replace(/^0(?=\d{4}$)/, '');
+  } else {
+    const usSym = normalizeUsSymbol(symbol);
+    resolvedSymbol = usSym;
+    secid = getCached<string>(`us_secid:${usSym}`) || US_SECID_PRESETS[usSym] || null;
+    if (!secid) {
+      const hits = await searchEastmoneySuggest(symbol, 'US');
+      const hit = hits.find((h) => h.symbol === usSym) || hits[0];
+      if (hit) {
+        secid = hit.secid;
+        resolvedSymbol = hit.symbol;
+        setCached(`us_secid:${hit.symbol}`, hit.secid, 24 * 3600_000);
+      }
+    }
+  }
+
+  let flowRes: { name: string; bars: EastmoneyFundFlowBar[] } | null = null;
+  let source = 'AKShare · 东方财富日线主力资金流向';
+
+  if (secid) {
+    flowRes = await fetchEastmoneyFundFlowBySecid(secid, days);
+  } else if (normMarket === 'US' && /^[A-Z]{1,6}(?:-[A-Z]{1,2})?$/.test(resolvedSymbol)) {
+    const candidates = [`105.${resolvedSymbol}`, `106.${resolvedSymbol}`, `107.${resolvedSymbol}`];
+    const probeResults = await Promise.all(
+      candidates.map(async (c) => ({ secid: c, res: await fetchEastmoneyFundFlowBySecid(c, days) }))
+    );
+    const hit = probeResults.find((r) => r.res !== null);
+    if (hit && hit.res) {
+      setCached(`us_secid:${resolvedSymbol}`, hit.secid, 24 * 3600_000);
+      flowRes = hit.res;
+    }
+  }
+
+  // Fallback 1 (CN real L2 order-size money flow from Sina Finance)
+  if (!flowRes && normMarket === 'CN' && /^\d{6}$/.test(cnCode6)) {
+    const [sinaBars, liveMap] = await Promise.all([
+      fetchSinaCnFundFlow(cnCode6, days),
+      fetchTencentBatchQuotes([{ market: 'CN', symbol: cnCode6 }]),
+    ]);
+    if (sinaBars && sinaBars.length > 0) {
+      const liveName = liveMap.get(`CN:${cnCode6}`)?.name || cnCode6;
+      flowRes = { name: liveName, bars: sinaBars };
+      source = 'AKShare · 新浪财经实盘分档资金流向';
+    }
+  }
+
+  // Fallback 2 (Real OHLCV + 15m intraday dollar flow decomposition for US / HK / CN)
+  if (!flowRes) {
+    const ohlcvFlow = await computeOhlcvFundFlowFallback(normMarket, resolvedSymbol, days);
+    if (ohlcvFlow && ohlcvFlow.bars.length > 0) {
+      resolvedSymbol = ohlcvFlow.symbol;
+      flowRes = { name: ohlcvFlow.name, bars: ohlcvFlow.bars };
+      source = ohlcvFlow.source;
+    }
+  }
+
+  if (!flowRes) {
+    throw new Error(`暂未获取到 ${resolvedSymbol} 的主力资金流向历史序列`);
+  }
+
+  const currency = normMarket === 'CN' ? 'CNY' : normMarket === 'HK' ? 'HKD' : 'USD';
+  const payload = {
+    market: normMarket,
+    symbol: resolvedSymbol,
+    name: flowRes.name,
+    currency,
+    source,
+    bars: flowRes.bars,
+    updatedAt: new Date().toISOString(),
+  };
+
+  setCached(cacheKey, payload, 60_000);
+  return payload;
+}
+
+interface TencentLiveQuote {
+  key: string; // e.g. "US:NVDA", "HK:00700", "CN:510300"
   code: string;
   name: string;
   price: number;
@@ -161,6 +864,7 @@ interface CnLiveQuote {
   open: number;
   high: number;
   low: number;
+  change: number;
   changePct: number;
   date: string;
   updatedAt: string;
@@ -173,14 +877,68 @@ function cnToTencentSymbol(code: string): string {
   return `sz${code}`;
 }
 
-async function fetchTencentCnQuotes(codes: string[]): Promise<Map<string, CnLiveQuote>> {
-  const map = new Map<string, CnLiveQuote>();
-  if (codes.length === 0) return map;
+function toTencentParam(market: 'US' | 'HK' | 'CN', symbol: string): {
+  param: string;
+  mapKey: string;
+} {
+  if (market === 'CN') {
+    const code = normalizeCnCode(symbol);
+    return { param: cnToTencentSymbol(code), mapKey: `CN:${code}` };
+  }
+  if (market === 'HK') {
+    const code5 = normalizeHk5Digits(symbol);
+    return { param: `hk${code5}`, mapKey: `HK:${code5}` };
+  }
+  const usSym = normalizeUsSymbol(symbol);
+  return { param: `us${usSym}`, mapKey: `US:${usSym}` };
+}
+
+function parseTencentTime(
+  marketPrefix: 'v_us' | 'v_hk' | 'v_cn',
+  rawTime: string
+): { dateStr: string; isoUpdated: string } {
+  const trimmed = rawTime.trim();
+  if (marketPrefix === 'v_cn') {
+    const m = trimmed.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
+    if (m) {
+      const d = `${m[1]}-${m[2]}-${m[3]}`;
+      return { dateStr: d, isoUpdated: `${d}T${m[4]}:${m[5]}:${m[6]}+08:00` };
+    }
+  } else if (marketPrefix === 'v_hk') {
+    const m = trimmed.match(/^(\d{4})\/(\d{2})\/(\d{2})\s+(\d{2}:\d{2}:\d{2})/);
+    if (m) {
+      const d = `${m[1]}-${m[2]}-${m[3]}`;
+      return { dateStr: d, isoUpdated: `${d}T${m[4]}+08:00` };
+    }
+  } else {
+    const m = trimmed.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})/);
+    if (m) {
+      return { dateStr: m[1], isoUpdated: `${m[1]}T${m[2]}-05:00` };
+    }
+  }
+  return { dateStr: toIsoDate(new Date()), isoUpdated: new Date().toISOString() };
+}
+
+async function fetchTencentBatchQuotes(
+  targets: Array<{ market: 'US' | 'HK' | 'CN'; symbol: string }>
+): Promise<Map<string, TencentLiveQuote>> {
+  const map = new Map<string, TencentLiveQuote>();
+  if (targets.length === 0) return map;
+
   try {
-    const tencentSyms = Array.from(new Set(codes.map(cnToTencentSymbol)));
-    const url = `https://qt.gtimg.cn/q=${tencentSyms.join(',')}`;
+    const paramToKey = new Map<string, string>();
+    const params: string[] = [];
+    for (const t of targets) {
+      const { param, mapKey } = toTencentParam(t.market, t.symbol);
+      if (!paramToKey.has(param)) {
+        paramToKey.set(param, mapKey);
+        params.push(param);
+      }
+    }
+
+    const url = `https://qt.gtimg.cn/q=${params.join(',')}`;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
+    const timer = setTimeout(() => controller.abort(), 3000);
     const resp = await fetch(url, {
       signal: controller.signal,
       headers: { 'User-Agent': 'Mozilla/5.0' },
@@ -190,61 +948,76 @@ async function fetchTencentCnQuotes(codes: string[]): Promise<Map<string, CnLive
 
     const buf = await resp.arrayBuffer();
     const text = new TextDecoder('gbk').decode(buf);
+
     for (const line of text.split(';')) {
-      const m = line.match(/v_(?:sh|sz)(\d+)="([^"]+)"/);
+      const m = line.match(/v_([a-zA-Z0-9._-]+)="([^"]+)"/);
       if (!m) continue;
-      const code = m[1];
+      const rawVar = m[1];
       const parts = m[2].split('~');
       if (parts.length < 35) continue;
-      const price = parseFloat(parts[3]);
-      const prevClose = parseFloat(parts[4]);
-      const open = parseFloat(parts[5]);
-      const changePct = parseFloat(parts[32]);
-      const high = parseFloat(parts[33]);
-      const low = parseFloat(parts[34]);
-      const rawTime = (parts[30] || '').trim();
-      const dateStr =
-        /^\d{8}/.test(rawTime)
-          ? `${rawTime.slice(0, 4)}-${rawTime.slice(4, 6)}-${rawTime.slice(6, 8)}`
-          : toIsoDate(new Date());
-      const isoUpdated =
-        /^\d{14}$/.test(rawTime)
-          ? `${dateStr}T${rawTime.slice(8, 10)}:${rawTime.slice(10, 12)}:${rawTime.slice(12, 14)}+08:00`
-          : new Date().toISOString();
 
-      if (Number.isFinite(price) && price > 0) {
-        map.set(code, {
-          code,
-          name: parts[1] || code,
-          price,
-          prevClose: Number.isFinite(prevClose) && prevClose > 0 ? prevClose : price,
-          open: Number.isFinite(open) && open > 0 ? open : price,
-          high: Number.isFinite(high) && high > 0 ? high : price,
-          low: Number.isFinite(low) && low > 0 ? low : price,
-          changePct: Number.isFinite(changePct)
-            ? changePct
-            : prevClose > 0
-              ? ((price - prevClose) / prevClose) * 100
-              : 0,
-          date: dateStr,
-          updatedAt: isoUpdated,
-        });
+      let mapKey = paramToKey.get(rawVar);
+      let marketKind: 'v_us' | 'v_hk' | 'v_cn' = 'v_cn';
+      if (rawVar.startsWith('us')) {
+        marketKind = 'v_us';
+        if (!mapKey) mapKey = `US:${rawVar.slice(2).toUpperCase()}`;
+      } else if (rawVar.startsWith('hk')) {
+        marketKind = 'v_hk';
+        if (!mapKey) mapKey = `HK:${rawVar.slice(2)}`;
+      } else {
+        const codeMatch = rawVar.match(/^(?:sh|sz)(\d+)$/);
+        if (codeMatch && !mapKey) mapKey = `CN:${codeMatch[1]}`;
       }
+      if (!mapKey) continue;
+
+      const price = parseFloat(parts[3]);
+      if (!Number.isFinite(price) || price <= 0) continue;
+
+      const prevCloseRaw = parseFloat(parts[4]);
+      const prevClose = Number.isFinite(prevCloseRaw) && prevCloseRaw > 0 ? prevCloseRaw : price;
+      const openRaw = parseFloat(parts[5]);
+      const open = Number.isFinite(openRaw) && openRaw > 0 ? openRaw : price;
+      const changeRaw = parseFloat(parts[31]);
+      const changePctRaw = parseFloat(parts[32]);
+      const highRaw = parseFloat(parts[33]);
+      const lowRaw = parseFloat(parts[34]);
+
+      const { dateStr, isoUpdated } = parseTencentTime(marketKind, parts[30] || '');
+
+      map.set(mapKey, {
+        key: mapKey,
+        code: mapKey.split(':')[1] || parts[2],
+        name: (parts[1] || '').trim() || mapKey.split(':')[1],
+        price,
+        prevClose,
+        open,
+        high: Number.isFinite(highRaw) && highRaw > 0 ? highRaw : price,
+        low: Number.isFinite(lowRaw) && lowRaw > 0 ? lowRaw : price,
+        change: Number.isFinite(changeRaw) ? changeRaw : price - prevClose,
+        changePct: Number.isFinite(changePctRaw)
+          ? changePctRaw
+          : prevClose > 0
+            ? ((price - prevClose) / prevClose) * 100
+            : 0,
+        date: dateStr,
+        updatedAt: isoUpdated,
+      });
     }
   } catch {
     // non-fatal
   }
+
   return map;
 }
 
-function mergeCnLiveQuoteIntoBars(bars: OhlcvBar[], live: CnLiveQuote | undefined): OhlcvBar[] {
+function mergeLiveQuoteIntoBars(bars: OhlcvBar[], live: TencentLiveQuote | undefined): OhlcvBar[] {
   if (!live || bars.length === 0) return bars;
   const copy = [...bars];
   const last = copy[copy.length - 1];
   if (last.date === live.date) {
     copy[copy.length - 1] = {
       ...last,
-      open: live.open,
+      open: live.open > 0 ? live.open : last.open,
       high: Math.max(last.high, live.high, live.price),
       low: Math.min(last.low, live.low, live.price),
       close: live.price,
@@ -260,6 +1033,13 @@ function mergeCnLiveQuoteIntoBars(bars: OhlcvBar[], live: CnLiveQuote | undefine
     });
   }
   return copy;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms)),
+  ]);
 }
 
 async function fetchYahooChart(
@@ -492,7 +1272,11 @@ async function fetchMacroSnapshot(forceRefresh = false) {
   const quotes = await Promise.all(
     specs.map(async (spec) => {
       try {
-        const q = await yahooFinance.quote(spec.symbol);
+        const q = await withTimeout(
+          yahooFinance.quote(spec.symbol).catch(() => null),
+          2500,
+          null
+        );
         const price =
           typeof q?.regularMarketPrice === 'number' ? q.regularMarketPrice : null;
         let changePct =
@@ -562,11 +1346,21 @@ async function fetchMacroSnapshot(forceRefresh = false) {
 
 async function fetchHistBarsCached(
   key: string,
-  loader: () => Promise<{ name: string; currency: string; bars: OhlcvBar[]; source: string }>
+  loader: () => Promise<{
+    name: string;
+    currency: string;
+    bars: OhlcvBar[];
+    source: string;
+    resolvedTicker?: string;
+  }>
 ) {
-  const cached = getCached<{ name: string; currency: string; bars: OhlcvBar[]; source: string }>(
-    key
-  );
+  const cached = getCached<{
+    name: string;
+    currency: string;
+    bars: OhlcvBar[];
+    source: string;
+    resolvedTicker?: string;
+  }>(key);
   if (cached) return cached;
   const loaded = await loader();
   setCached(key, loaded, 300_000); // Daily historical bars cached 5 min for fast live quote overlays
@@ -580,8 +1374,7 @@ async function fetchStockData(
   options?: {
     forceRefresh?: boolean;
     includeExtendedIntraday?: boolean;
-    prefetchedYahooQuote?: Record<string, unknown> | null;
-    prefetchedCnLive?: CnLiveQuote;
+    prefetchedLive?: TencentLiveQuote;
   }
 ) {
   const normMarket = market.toUpperCase();
@@ -591,120 +1384,274 @@ async function fetchStockData(
     normMarket === 'US' && includeIntraday ? 'ext' : 'base'
   }`;
 
-  if (!options?.forceRefresh && !options?.prefetchedYahooQuote && !options?.prefetchedCnLive) {
+  if (!options?.forceRefresh && !options?.prefetchedLive) {
     const cached = getCached<unknown>(cacheKey);
     if (cached) return cached;
   }
 
   if (normMarket === 'US') {
-    const [data, rawQuote, extIntraday] = await Promise.all([
-      fetchHistBarsCached(`hist:US:${cleanSym}:${days}`, async () => {
-        const res = await fetchYahooChart(cleanSym, days);
-        return { ...res, source: 'Yahoo Finance' };
+    let usSym = normalizeUsSymbol(symbol);
+    const isAsciiTicker = /^[A-Z]{1,6}(?:-[A-Z]{1,2})?$/.test(usSym);
+
+    type ExtIntradayResult = {
+      bars: Array<{
+        timestamp: string;
+        etDate: string;
+        etTimeLabel: string;
+        session: 'pre' | 'regular' | 'post';
+        price: number;
+        volume: number;
+      }>;
+      prevClose: number | null;
+    };
+    const emptyExt: ExtIntradayResult = { bars: [], prevClose: null };
+
+    const getExtendedEnrichment = (sym: string): Promise<[Record<string, unknown> | null, ExtIntradayResult]> => {
+      if (!includeIntraday) return Promise.resolve([null, emptyExt]);
+      const yQuoteKey = `yquote:US:${sym}`;
+      const yExtKey = `yext:US:${sym}`;
+      const cachedYQ = !options?.forceRefresh ? getCached<Record<string, unknown>>(yQuoteKey) : null;
+      const cachedYExt = !options?.forceRefresh ? getCached<ExtIntradayResult>(yExtKey) : null;
+
+      const yQuotePromise = cachedYQ
+        ? Promise.resolve(cachedYQ)
+        : yahooFinance
+            .quote(sym)
+            .then((q) => {
+              const rec = q as unknown as Record<string, unknown>;
+              setCached(yQuoteKey, rec, 15_000);
+              return rec;
+            })
+            .catch(() => null);
+
+      const yExtPromise = cachedYExt
+        ? Promise.resolve(cachedYExt)
+        : fetchYahooUsExtendedBars(sym)
+            .then((res) => {
+              setCached(yExtKey, res, 45_000);
+              return res;
+            })
+            .catch(() => emptyExt);
+
+      return Promise.all([
+        cachedYQ ? yQuotePromise : withTimeout(yQuotePromise, 1200, null),
+        cachedYExt ? yExtPromise : withTimeout(yExtPromise, 1200, emptyExt),
+      ]);
+    };
+
+    // 1. Run AKShare/Eastmoney K-lines + Tencent real-time quote + optional pre/post-market in parallel
+    const [emResult, initialLiveMap, initialExtPair] = await Promise.all([
+      fetchHistBarsCached(`hist:US:em:${usSym}:${days}`, async () => {
+        const em = await resolveAndFetchUsEastmoneyKlines(symbol, days);
+        if (em) {
+          return {
+            name: em.name,
+            currency: 'USD',
+            bars: em.bars,
+            source: `AKShare · 东方财富 (${em.symbol})`,
+            resolvedTicker: em.symbol,
+          };
+        }
+        // Fallback to Yahoo chart if Eastmoney lacks this ticker
+        let ySym = usSym;
+        try {
+          const y = await fetchYahooChart(ySym, days);
+          return { ...y, source: 'Yahoo Finance', resolvedTicker: ySym };
+        } catch (firstErr) {
+          const fallbackSym = await resolveUsTickerViaSearch(symbol);
+          if (!fallbackSym || fallbackSym === ySym) throw firstErr;
+          ySym = fallbackSym;
+          const y = await fetchYahooChart(ySym, days);
+          return { ...y, source: 'Yahoo Finance', resolvedTicker: ySym };
+        }
       }),
-      options?.prefetchedYahooQuote
-        ? Promise.resolve(options.prefetchedYahooQuote)
-        : yahooFinance.quote(cleanSym).catch(() => null),
-      includeIntraday
-        ? fetchYahooUsExtendedBars(cleanSym).catch(() => ({ bars: [], prevClose: null }))
-        : Promise.resolve({ bars: [], prevClose: null }),
+      options?.prefetchedLive
+        ? Promise.resolve(new Map([[`US:${usSym}`, options.prefetchedLive]]))
+        : isAsciiTicker
+          ? fetchTencentBatchQuotes([{ market: 'US', symbol: usSym }])
+          : Promise.resolve(new Map<string, TencentLiveQuote>()),
+      isAsciiTicker ? getExtendedEnrichment(usSym) : Promise.resolve<[Record<string, unknown> | null, ExtIntradayResult]>([null, emptyExt]),
     ]);
 
-    const extendedQuote = extractExtendedQuote(
-      rawQuote as unknown as Record<string, unknown> | null
-    );
-    const shortName =
-      typeof (rawQuote as Record<string, unknown> | null)?.shortName === 'string'
-        ? String((rawQuote as Record<string, unknown>).shortName)
-        : data.name;
+    if (emResult.resolvedTicker) {
+      usSym = emResult.resolvedTicker;
+    }
+
+    let live = initialLiveMap.get(`US:${usSym}`);
+    let [rawYahooQuote, extIntraday] = initialExtPair;
+
+    if (!live && /^[A-Z]{1,6}(?:-[A-Z]{1,2})?$/.test(usSym)) {
+      const [retryMap, extPair] = await Promise.all([
+        fetchTencentBatchQuotes([{ market: 'US', symbol: usSym }]),
+        !isAsciiTicker && includeIntraday ? getExtendedEnrichment(usSym) : Promise.resolve(initialExtPair),
+      ]);
+      live = retryMap.get(`US:${usSym}`);
+      [rawYahooQuote, extIntraday] = extPair;
+    }
+    const mergedBars = mergeLiveQuoteIntoBars(emResult.bars, live);
+
+    const yahooExt = extractExtendedQuote(rawYahooQuote);
+    const extendedQuote = yahooExt
+      ? {
+          ...yahooExt,
+          regularPrice: live?.price ?? yahooExt.regularPrice,
+          regularChange: live?.change ?? yahooExt.regularChange,
+          regularChangePct: live?.changePct ?? yahooExt.regularChangePct,
+          regularTime: live?.updatedAt ?? yahooExt.regularTime,
+        }
+      : live
+        ? {
+            marketState: 'REGULAR',
+            hasPrePostMarketData: false,
+            exchangeDataDelayedBy: 0,
+            regularPrice: live.price,
+            regularChange: live.change,
+            regularChangePct: live.changePct,
+            regularTime: live.updatedAt,
+            preMarketPrice: null,
+            preMarketChange: null,
+            preMarketChangePct: null,
+            preMarketTime: null,
+            postMarketPrice: null,
+            postMarketChange: null,
+            postMarketChangePct: null,
+            postMarketTime: null,
+          }
+        : null;
+
+    const displayName =
+      live?.name ||
+      (emResult.name && emResult.name !== usSym ? emResult.name : '') ||
+      (typeof rawYahooQuote?.shortName === 'string' ? String(rawYahooQuote.shortName) : usSym);
 
     const payload = {
       market: 'US',
-      symbol: cleanSym,
-      resolvedSymbol: cleanSym,
-      name: shortName || data.name,
+      symbol: usSym,
+      resolvedSymbol: usSym,
+      name: displayName,
       currency: 'USD',
-      bars: data.bars,
-      source: 'Yahoo Finance',
+      bars: mergedBars,
+      source: live ? 'AKShare (东方财富K线 + 腾讯实时)' : emResult.source,
       extendedQuote,
       extendedBars: extIntraday.bars,
-      prevClose: extIntraday.prevClose,
-      quoteDelayMinutes: extendedQuote?.exchangeDataDelayedBy ?? null,
+      prevClose: extIntraday.prevClose ?? live?.prevClose ?? null,
+      quoteDelayMinutes: live ? 0 : yahooExt?.exchangeDataDelayedBy ?? null,
       quoteUpdatedAt:
-        extendedQuote?.preMarketTime ||
-        extendedQuote?.postMarketTime ||
-        extendedQuote?.regularTime ||
+        live?.updatedAt ||
+        yahooExt?.preMarketTime ||
+        yahooExt?.postMarketTime ||
+        yahooExt?.regularTime ||
         new Date().toISOString(),
     };
-    setCached(cacheKey, payload, 12_000);
+    setCached(cacheKey, payload, 10_000);
     return payload;
   }
 
   if (normMarket === 'HK') {
-    const hkSym = normalizeHkSymbol(cleanSym);
-    const [data, rawQuote] = await Promise.all([
-      fetchHistBarsCached(`hist:HK:${hkSym}:${days}`, async () => {
-        const res = await fetchYahooChart(hkSym, days);
-        return { ...res, source: 'Yahoo Finance' };
-      }),
-      options?.prefetchedYahooQuote
-        ? Promise.resolve(options.prefetchedYahooQuote)
-        : yahooFinance.quote(hkSym).catch(() => null),
-    ]);
-    const ext = extractExtendedQuote(rawQuote as unknown as Record<string, unknown> | null);
-    const bars = [...data.bars];
-    if (ext?.regularPrice && bars.length > 0) {
-      const last = bars[bars.length - 1];
-      bars[bars.length - 1] = {
-        ...last,
-        close: ext.regularPrice,
-        high: Math.max(last.high, ext.regularPrice),
-        low: Math.min(last.low, ext.regularPrice),
-      };
+    let resolvedRaw = cleanSym;
+    if (!/^\d+$/.test(cleanSym.replace(/\.HK$/i, ''))) {
+      const hkHits = await searchEastmoneySuggest(symbol, 'HK');
+      if (hkHits.length > 0) {
+        resolvedRaw = hkHits[0].symbol;
+      }
     }
+    const code5 = normalizeHk5Digits(resolvedRaw);
+    const secid = `116.${code5}`;
+    const yahooHk = `${code5.replace(/^0(?=\d{4}$)/, '')}.HK`;
+
+    const [hist, liveMap] = await Promise.all([
+      fetchHistBarsCached(`hist:HK:em:${code5}:${days}`, async () => {
+        const em = await fetchEastmoneyKlinesBySecid(secid, days);
+        if (em) {
+          return {
+            name: em.name,
+            currency: 'HKD',
+            bars: em.bars,
+            source: 'AKShare (东方财富前复权)',
+          };
+        }
+        const y = await fetchYahooChart(yahooHk, days);
+        return { ...y, source: 'Yahoo Finance' };
+      }),
+      options?.prefetchedLive
+        ? Promise.resolve(new Map([[`HK:${code5}`, options.prefetchedLive]]))
+        : fetchTencentBatchQuotes([{ market: 'HK', symbol: code5 }]),
+    ]);
+
+    const live = liveMap.get(`HK:${code5}`);
+    const mergedBars = mergeLiveQuoteIntoBars(hist.bars, live);
+    const shortHk = code5.replace(/^0(?=\d{4}$)/, '');
+
     const payload = {
       market: 'HK',
-      symbol: cleanSym.replace(/\.HK$/i, ''),
-      resolvedSymbol: hkSym,
-      name:
-        typeof (rawQuote as Record<string, unknown> | null)?.shortName === 'string'
-          ? String((rawQuote as Record<string, unknown>).shortName)
-          : data.name,
+      symbol: shortHk,
+      resolvedSymbol: yahooHk,
+      name: live?.name || hist.name,
       currency: 'HKD',
-      bars,
-      source: 'Yahoo Finance',
-      extendedQuote: ext,
-      quoteDelayMinutes: ext?.exchangeDataDelayedBy ?? 15,
-      quoteUpdatedAt: ext?.regularTime || new Date().toISOString(),
+      bars: mergedBars,
+      source: live ? 'AKShare (东方财富前复权 + 腾讯实时)' : hist.source,
+      extendedQuote: live
+        ? {
+            marketState: 'REGULAR',
+            hasPrePostMarketData: false,
+            exchangeDataDelayedBy: 0,
+            regularPrice: live.price,
+            regularChange: live.change,
+            regularChangePct: live.changePct,
+            regularTime: live.updatedAt,
+            preMarketPrice: null,
+            preMarketChange: null,
+            preMarketChangePct: null,
+            preMarketTime: null,
+            postMarketPrice: null,
+            postMarketChange: null,
+            postMarketChangePct: null,
+            postMarketTime: null,
+          }
+        : null,
+      quoteDelayMinutes: live ? 0 : 15,
+      quoteUpdatedAt: live?.updatedAt || new Date().toISOString(),
     };
-    setCached(cacheKey, payload, 15_000);
+    setCached(cacheKey, payload, 10_000);
     return payload;
   }
 
   if (normMarket === 'CN') {
-    const code = normalizeCnCode(cleanSym);
+    let code = normalizeCnCode(cleanSym);
+    let cnSecid: string | null = null;
+    if (!/^\d{6}$/.test(code)) {
+      const cnHits = await searchEastmoneySuggest(symbol, 'CN');
+      if (cnHits.length > 0) {
+        code = normalizeCnCode(cnHits[0].symbol);
+        cnSecid = cnHits[0].secid;
+      }
+    }
+    const marketId =
+      code.startsWith('6') || code.startsWith('5') || code.startsWith('9') ? '1' : '0';
+    const secid = cnSecid || `${marketId}.${code}`;
+
     const [hist, liveMap] = await Promise.all([
-      fetchHistBarsCached(`hist:CN:${code}:${days}`, async () => {
-        const em = await fetchEastmoneyKlines(code, days);
+      fetchHistBarsCached(`hist:CN:em:${code}:${days}`, async () => {
+        const em = await fetchEastmoneyKlinesBySecid(secid, days);
         if (em) {
           return {
             name: em.name,
             currency: 'CNY',
             bars: em.bars,
-            source: 'Eastmoney (前复权)',
+            source: 'AKShare (东方财富前复权)',
           };
         }
         const yahooSym = cnToYahooSymbol(code);
         const res = await fetchYahooChart(yahooSym, days);
         return { ...res, source: 'Yahoo Finance' };
       }),
-      options?.prefetchedCnLive
-        ? Promise.resolve(new Map([[code, options.prefetchedCnLive]]))
-        : fetchTencentCnQuotes([code]),
+      options?.prefetchedLive
+        ? Promise.resolve(new Map([[`CN:${code}`, options.prefetchedLive]]))
+        : fetchTencentBatchQuotes([{ market: 'CN', symbol: code }]),
     ]);
 
-    const live = liveMap.get(code);
-    const mergedBars = mergeCnLiveQuoteIntoBars(hist.bars, live);
+    const live = liveMap.get(`CN:${code}`);
+    const mergedBars = mergeLiveQuoteIntoBars(hist.bars, live);
 
     const payload = {
       market: 'CN',
@@ -713,7 +1660,7 @@ async function fetchStockData(
       name: live?.name || hist.name,
       currency: 'CNY',
       bars: mergedBars,
-      source: live ? 'Eastmoney K线 + 腾讯实时行情' : hist.source,
+      source: live ? 'AKShare (东方财富前复权 + 腾讯实时)' : hist.source,
       quoteDelayMinutes: live ? 0 : 15,
       quoteUpdatedAt: live?.updatedAt || new Date().toISOString(),
     };
@@ -1533,7 +2480,7 @@ async function startServer() {
 
   app.get('/api/options', async (req, res) => {
     try {
-      const symbol = String(req.query.symbol || 'NVDA').trim().toUpperCase();
+      const symbol = normalizeUsSymbol(String(req.query.symbol || 'NVDA'));
       const dateStr = req.query.date ? String(req.query.date).trim() : '';
       const forceRefresh = req.query.refresh === '1';
       const cacheKey = `options:${symbol}:${dateStr || 'default'}`;
@@ -1596,59 +2543,73 @@ async function startServer() {
     }
   });
 
-  // Batch watchlist fetch for multi-market radar table
+  app.get('/api/symbol-search', async (req, res) => {
+    try {
+      const q = String(req.query.q || '').trim();
+      const market = req.query.market ? String(req.query.market).trim().toUpperCase() : undefined;
+      if (!q) {
+        res.json({ items: [] });
+        return;
+      }
+      const items = await searchEastmoneySuggest(q, market);
+      res.json({ items: items.slice(0, 8) });
+    } catch {
+      res.json({ items: [] });
+    }
+  });
+
+  app.get('/api/fund-flow', async (req, res) => {
+    try {
+      const market = String(req.query.market || 'US').trim().toUpperCase();
+      const symbol = String(req.query.symbol || 'NVDA').trim();
+      const days = Math.min(120, Math.max(20, Number(req.query.days || 60)));
+      const forceRefresh = req.query.refresh === '1';
+      if (!symbol) {
+        res.status(400).json({ error: '请提供标的代码' });
+        return;
+      }
+      const data = await resolveFundFlowData(market, symbol, days, forceRefresh);
+      res.json(data);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '资金流向数据获取失败';
+      res.status(404).json({ error: message });
+    }
+  });
+
+  // Batch watchlist fetch for multi-market radar table (single Tencent batch call + Eastmoney K-lines)
   app.post('/api/watchlist', async (req, res) => {
     try {
       const items = Array.isArray(req.body?.items) ? req.body.items.slice(0, 16) : [];
       const forceRefresh = Boolean(req.body?.refresh);
 
-      const yahooSyms: string[] = [];
-      const cnCodes: string[] = [];
+      const batchTargets: Array<{ market: 'US' | 'HK' | 'CN'; symbol: string }> = [];
       for (const item of items as Array<{ market?: string; symbol?: string }>) {
         if (!item?.symbol) continue;
         const mkt = String(item.market).toUpperCase();
-        const sym = item.symbol.trim().toUpperCase();
-        if (mkt === 'US') yahooSyms.push(sym);
-        else if (mkt === 'HK') yahooSyms.push(normalizeHkSymbol(sym));
-        else if (mkt === 'CN') cnCodes.push(normalizeCnCode(sym));
+        if (mkt === 'US' || mkt === 'HK' || mkt === 'CN') {
+          batchTargets.push({ market: mkt, symbol: item.symbol });
+        }
       }
 
-      const [yahooRawMap, cnLiveMap] = await Promise.all([
-        (async () => {
-          const map = new Map<string, Record<string, unknown>>();
-          if (yahooSyms.length > 0) {
-            try {
-              const quotes = await yahooFinance.quote(yahooSyms);
-              const arr = Array.isArray(quotes) ? quotes : [quotes];
-              for (const q of arr) {
-                if (q && typeof q.symbol === 'string') {
-                  map.set(q.symbol.toUpperCase(), q as unknown as Record<string, unknown>);
-                }
-              }
-            } catch {
-              // fallback inside fetchStockData
-            }
-          }
-          return map;
-        })(),
-        fetchTencentCnQuotes(cnCodes),
-      ]);
+      const liveMap = await fetchTencentBatchQuotes(batchTargets);
 
       const results = await Promise.all(
         items.map(async (item: { market: string; symbol: string }) => {
           try {
-            const mkt = String(item.market).toUpperCase();
-            const cleanSym = item.symbol.trim().toUpperCase();
-            const yKey = mkt === 'HK' ? normalizeHkSymbol(cleanSym) : cleanSym;
-            const cnKey = normalizeCnCode(cleanSym);
+            const mkt = String(item.market).toUpperCase() as 'US' | 'HK' | 'CN';
+            const { mapKey } = toTencentParam(mkt, item.symbol);
 
             const data = await fetchStockData(item.market, item.symbol, 420, {
               forceRefresh,
               includeExtendedIntraday: false,
-              prefetchedYahooQuote: yahooRawMap.get(yKey) ?? null,
-              prefetchedCnLive: mkt === 'CN' ? cnLiveMap.get(cnKey) : undefined,
+              prefetchedLive: liveMap.get(mapKey),
             });
-            return { ok: true, data };
+            return {
+              ok: true,
+              market: item.market,
+              symbol: item.symbol,
+              data,
+            };
           } catch (err) {
             return {
               ok: false,

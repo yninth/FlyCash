@@ -40,6 +40,7 @@ import type {
 } from '../types/trading';
 import { AtrAnomalyPanel } from './AtrAnomalyPanel';
 import { CandlestickChart, ExtendedIntradayChart, PriceForecastChart } from './Charts';
+import { FundFlowForecastPanel } from './FundFlowForecastPanel';
 import { PreMarketSentimentPanel } from './PreMarketSentimentPanel';
 import { StockNewsPanel } from './StockNewsPanel';
 
@@ -116,6 +117,14 @@ function currencySymbolOf(c: CurrencyType): string {
   return c === 'CNY' ? '¥' : c === 'HKD' ? 'HK$' : '$';
 }
 
+interface SymbolSuggestItem {
+  market: MarketType;
+  symbol: string;
+  name: string;
+  secid: string;
+  exchangeLabel: string;
+}
+
 export const EquityRadarView: React.FC<EquityRadarViewProps> = ({
   riskConfig,
   usdCny,
@@ -138,6 +147,13 @@ export const EquityRadarView: React.FC<EquityRadarViewProps> = ({
   const [marketInput, setMarketInput] = useState<MarketType>(selectedMarket);
   const [symbolInput, setSymbolInput] = useState<string>(selectedSymbol);
   const [lotSize, setLotSize] = useState<number>(selectedMarket === 'US' ? 1 : 100);
+
+  const [suggestions, setSuggestions] = useState<SymbolSuggestItem[]>([]);
+  const [suggestOpen, setSuggestOpen] = useState(false);
+  const [suggestLoading, setSuggestLoading] = useState(false);
+  const [activeSuggestIdx, setActiveSuggestIdx] = useState(-1);
+  const searchBoxRef = useRef<HTMLDivElement | null>(null);
+  const skipSuggestRef = useRef(true);
 
   const [forecastDays, setForecastDays] = useState<number>(20);
   const [forecastMode, setForecastMode] = useState<ForecastModelMode>('momentum');
@@ -237,13 +253,64 @@ export const EquityRadarView: React.FC<EquityRadarViewProps> = ({
   }, [notifPerm, onNotify]);
 
   useEffect(() => {
+    skipSuggestRef.current = true;
     setMarketInput(selectedMarket);
     setSymbolInput(selectedSymbol);
     setLotSize(selectedMarket === 'US' ? 1 : 100);
+    setSuggestOpen(false);
+    setSuggestions([]);
     if (selectedMarket !== 'US' && chartMode === 'extended') {
       setChartMode('daily');
     }
   }, [selectedMarket, selectedSymbol, chartMode]);
+
+  useEffect(() => {
+    const handleClickOutside = (ev: MouseEvent) => {
+      if (searchBoxRef.current && !searchBoxRef.current.contains(ev.target as Node)) {
+        setSuggestOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  useEffect(() => {
+    if (skipSuggestRef.current) return;
+    const q = symbolInput.trim();
+    if (!q || q.length < 1) {
+      setSuggestions([]);
+      setSuggestOpen(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      setSuggestLoading(true);
+      try {
+        const res = await fetch(`/api/symbol-search?q=${encodeURIComponent(q)}`, {
+          signal: controller.signal,
+        });
+        if (!res.ok) {
+          setSuggestions([]);
+          return;
+        }
+        const json = (await res.json()) as { items?: SymbolSuggestItem[] };
+        const list = Array.isArray(json.items) ? json.items : [];
+        setSuggestions(list);
+        setActiveSuggestIdx(-1);
+        setSuggestOpen(list.length > 0);
+      } catch {
+        // ignore abort/network error
+      } finally {
+        setSuggestLoading(false);
+      }
+    }, 240);
+
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [symbolInput]);
 
   const loadStock = useCallback(
     async (
@@ -269,6 +336,10 @@ export const EquityRadarView: React.FC<EquityRadarViewProps> = ({
         if (!res.ok) throw new Error(data.error || '行情请求失败');
         const typed = data as StockHistoryResponse;
         setStockData(typed);
+        if (typed.symbol && typed.symbol !== clean) {
+          skipSuggestRef.current = true;
+          setSymbolInput(typed.symbol);
+        }
         if (announce) {
           onNotify(
             'success',
@@ -515,16 +586,46 @@ export const EquityRadarView: React.FC<EquityRadarViewProps> = ({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    const clean = symbolInput.trim().toUpperCase();
+    skipSuggestRef.current = true;
+    setSuggestOpen(false);
+    let clean = symbolInput.trim().toUpperCase();
     if (!clean) {
       onNotify('warning', '请输入股票或 ETF 代码');
       return;
     }
-    if (marketInput === selectedMarket && clean === selectedSymbol) {
-      loadStock(marketInput, clean, true, true);
+
+    let targetMarket = marketInput;
+    // Handle broker copy-pastes like "US.SNXX", "SNXX.US", "SNXX 2倍做多SNDK ETF-Tradr"
+    if (/^(?:US|NASDAQ|NYSE|AMEX)\./i.test(clean) || /\.US$/i.test(clean)) {
+      targetMarket = 'US';
+      clean = clean.replace(/^(?:US|NASDAQ|NYSE|AMEX)\./i, '').replace(/\.US$/i, '');
+    } else if (/^HK\./i.test(clean) || /\.HK$/i.test(clean)) {
+      targetMarket = 'HK';
+      clean = clean.replace(/^HK\./i, '').replace(/\.HK$/i, '');
+    } else if (/^(?:SH|SZ)\./i.test(clean) || /\.(?:SH|SZ|SS)$/i.test(clean)) {
+      targetMarket = 'CN';
+      clean = clean.replace(/^(?:SH|SZ)\./i, '').replace(/\.(?:SH|SZ|SS)$/i, '');
+    }
+
+    const tokenMatch = clean.match(/^([A-Z0-9]{1,6}(?:[.-][A-Z]{1,2})?)(?:\s+.*)?$/);
+    if (tokenMatch) {
+      clean = tokenMatch[1];
+    }
+
+    if (targetMarket !== 'US' && /^[A-Z]{1,6}(?:[.-][A-Z]{1,2})?$/.test(clean)) {
+      targetMarket = 'US';
+      setMarketInput('US');
+      setLotSize(1);
+      onNotify('info', `已自动切换为美股市场查询 ${clean}`);
+    }
+
+    setSymbolInput(clean);
+
+    if (targetMarket === selectedMarket && clean === selectedSymbol) {
+      loadStock(targetMarket, clean, true, true);
     } else {
-      onSelectSymbol(marketInput, clean);
-      onNotify('info', `正在分析 ${MARKET_PRESETS[marketInput].label} ${clean}...`);
+      onSelectSymbol(targetMarket, clean);
+      onNotify('info', `正在分析 ${MARKET_PRESETS[targetMarket].label} ${clean}...`);
     }
   };
 
@@ -541,6 +642,26 @@ export const EquityRadarView: React.FC<EquityRadarViewProps> = ({
     onAddWatchlist({ market: marketInput, symbol: clean, lotSize });
   };
 
+  const handleSelectSuggestion = (item: SymbolSuggestItem) => {
+    skipSuggestRef.current = true;
+    const nextLot = item.market === 'US' ? 1 : 100;
+    setMarketInput(item.market);
+    setSymbolInput(item.symbol);
+    setLotSize(nextLot);
+    setSuggestOpen(false);
+    setSuggestions([]);
+    setActiveSuggestIdx(-1);
+    if (item.market === selectedMarket && item.symbol === selectedSymbol) {
+      loadStock(item.market, item.symbol, true, true);
+    } else {
+      onSelectSymbol(item.market, item.symbol);
+      onNotify(
+        'info',
+        `正在分析 ${MARKET_PRESETS[item.market].label} ${item.name} (${item.symbol})`
+      );
+    }
+  };
+
   return (
     <div className="space-y-5">
       {/* Row 1: Unified Search Control, Watchlist Quick-Switch & Quote/KPI Strip */}
@@ -555,6 +676,8 @@ export const EquityRadarView: React.FC<EquityRadarViewProps> = ({
                     key={m}
                     type="button"
                     onClick={() => {
+                      skipSuggestRef.current = true;
+                      setSuggestOpen(false);
                       setMarketInput(m);
                       setSymbolInput(MARKET_PRESETS[m].codes[0]);
                       setLotSize(MARKET_PRESETS[m].defaultLot);
@@ -571,17 +694,83 @@ export const EquityRadarView: React.FC<EquityRadarViewProps> = ({
               </div>
             </div>
 
-            <div>
+            <div ref={searchBoxRef} className="relative">
               <label htmlFor="radar-symbol" className="block text-[11px] text-slate-400 mb-1">
-                标的代码
+                标的代码 / 名称
               </label>
               <input
                 id="radar-symbol"
                 value={symbolInput}
-                onChange={(e) => setSymbolInput(e.target.value)}
-                placeholder="NVDA / 0700 / 510300"
-                className="w-36 sm:w-40 rounded-md border border-slate-700 bg-slate-900 px-3 py-1.5 text-sm font-mono text-slate-100 focus:border-sky-500 focus:outline-none"
+                autoComplete="off"
+                onFocus={() => {
+                  if (suggestions.length > 0) setSuggestOpen(true);
+                }}
+                onChange={(e) => {
+                  skipSuggestRef.current = false;
+                  setSymbolInput(e.target.value);
+                  setSuggestOpen(true);
+                }}
+                onKeyDown={(e) => {
+                  if (!suggestOpen || suggestions.length === 0) return;
+                  if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    setActiveSuggestIdx((idx) => (idx + 1) % suggestions.length);
+                  } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    setActiveSuggestIdx((idx) =>
+                      idx <= 0 ? suggestions.length - 1 : idx - 1
+                    );
+                  } else if (e.key === 'Enter' && activeSuggestIdx >= 0) {
+                    e.preventDefault();
+                    handleSelectSuggestion(suggestions[activeSuggestIdx]);
+                  } else if (e.key === 'Escape') {
+                    setSuggestOpen(false);
+                  }
+                }}
+                placeholder="NVDA / 腾讯 / 二倍做多SNDK"
+                className="w-44 sm:w-52 rounded-md border border-slate-700 bg-slate-900 px-3 py-1.5 text-sm font-mono text-slate-100 placeholder:text-slate-600 focus:border-sky-500 focus:outline-none"
               />
+
+              {suggestOpen && (suggestLoading || suggestions.length > 0) && (
+                <div className="absolute left-0 top-full z-40 mt-1 w-72 sm:w-80 rounded-md border border-slate-700 bg-[#0F172A] shadow-xl overflow-hidden">
+                  {suggestLoading && suggestions.length === 0 ? (
+                    <div className="px-3 py-2 text-xs text-slate-400">
+                      正在检索东方财富标的...
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-slate-800/80 max-h-64 overflow-y-auto">
+                      {suggestions.map((item, idx) => (
+                        <button
+                          key={`${item.market}-${item.secid}`}
+                          type="button"
+                          onMouseDown={(ev) => {
+                            ev.preventDefault();
+                            handleSelectSuggestion(item);
+                          }}
+                          className={`w-full flex items-center justify-between gap-2 px-3 py-2 text-left text-xs transition-colors ${
+                            idx === activeSuggestIdx
+                              ? 'bg-sky-500/15 text-slate-100'
+                              : 'hover:bg-slate-800/70 text-slate-200'
+                          }`}
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className="text-[11px] text-slate-400 shrink-0">
+                              {MARKET_PRESETS[item.market].label}
+                            </span>
+                            <span className="font-mono font-semibold text-sky-300 tabular-nums shrink-0">
+                              {item.symbol}
+                            </span>
+                            <span className="truncate text-slate-200">{item.name}</span>
+                          </div>
+                          <span className="text-[11px] text-slate-500 shrink-0">
+                            {item.exchangeLabel}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             <div>
@@ -1325,7 +1514,15 @@ export const EquityRadarView: React.FC<EquityRadarViewProps> = ({
             bars={enrichedBars}
           />
 
-          {/* Row 4: AI Pre-Market Sentiment Heat & Bull/Bear Polarity Comparison */}
+          {/* Row 4: Main-Force Capital Inflow/Outflow & Future Flow Forecast */}
+          <FundFlowForecastPanel
+            market={stockData.market}
+            symbol={stockData.symbol}
+            stockName={stockData.name}
+            currencySymbol={analysis.currSym}
+          />
+
+          {/* Row 5: AI Pre-Market Sentiment Heat & Bull/Bear Polarity Comparison */}
           <PreMarketSentimentPanel
             market={stockData.market}
             symbol={stockData.symbol}

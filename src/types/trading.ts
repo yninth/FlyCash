@@ -197,6 +197,31 @@ export interface PayoffGridPoint {
   expiryPnl: number;
 }
 
+export interface GreeksCurvePoint {
+  spot: number;
+  delta: number;
+  gamma: number;
+  thetaPerDay: number;
+  deltaNear: number;
+  gammaNear: number;
+  thetaNear: number;
+  absDeltaPct: number;
+  gammaNormPct: number;
+  thetaNormPct: number;
+}
+
+export interface GreeksCurveSimulation {
+  points: GreeksCurvePoint[];
+  nearDte: number;
+  spotDelta: number;
+  spotGamma: number;
+  spotThetaPerDay: number;
+  peakGamma: number;
+  peakGammaSpot: number;
+  peakAbsTheta: number;
+  peakThetaSpot: number;
+}
+
 export interface LedgerEntry {
   id: string;
   market: 'A股' | '港股' | '美股' | '美股期权' | '港股期权';
@@ -441,3 +466,121 @@ export interface AtrAnomalyReport {
   extremeThresholdPct: number;
   series: AtrAnomalyPoint[];
 }
+
+export type VolatilityCalendarMetric = 'est_iv' | 'hv20';
+
+export interface VolatilityCalendarDay {
+  date: string;
+  weekday: number; // 1=Mon .. 5=Fri
+  isTradingDay: boolean;
+  isFutureInWeek: boolean;
+  close: number | null;
+  dailyReturnPct: number | null;
+  hv20: number | null;
+  estimatedIv: number | null;
+  value: number | null;
+  isLiveAnchor: boolean;
+  percentile6M: number | null;
+}
+
+export interface VolatilityCalendarWeek {
+  weekStart: string;
+  monthLabel: string | null;
+  days: VolatilityCalendarDay[];
+}
+
+export interface VolatilityCalendarReport {
+  startDate: string;
+  endDate: string;
+  metricMode: VolatilityCalendarMetric;
+  weeks: VolatilityCalendarWeek[];
+  tradingDayCount: number;
+  currentHv20: number | null;
+  liveAtmIv: number | null;
+  currentValue: number | null;
+  ivToHvRatio: number;
+  minVal: number;
+  medianVal: number;
+  maxVal: number;
+  currentPercentile: number | null;
+  lowVolThreshold: number;
+  highVolThreshold: number;
+  entrySignal: 'buyer' | 'neutral' | 'seller';
+  entryHeadline: string;
+  entryGuidance: string;
+  latestTradingDay: VolatilityCalendarDay | null;
+}
+
+export interface FundFlowBar {
+  date: string;
+  mainNet: number;
+  superLargeNet: number;
+  largeNet: number;
+  mediumNet: number;
+  smallNet: number;
+  mainPct: number;
+  superLargePct: number;
+  largePct: number;
+  mediumPct: number;
+  smallPct: number;
+  close: number;
+  changePct: number;
+}
+
+export interface FundFlowResponse {
+  market: MarketType;
+  symbol: string;
+  name: string;
+  currency: CurrencyType;
+  source: string;
+  bars: FundFlowBar[];
+  updatedAt: string;
+}
+
+export interface FundFlowChartPoint {
+  label: string;
+  isForecast: boolean;
+  histMainNet: number | null;
+  forecastMainNet: number | null;
+  forecastLower: number | null;
+  forecastRange: [number, number] | null;
+  cumulativeMainNet: number;
+  superLargeNet: number | null;
+  largeNet: number | null;
+  mediumNet: number | null;
+  smallNet: number | null;
+  mainPct: number | null;
+  close: number | null;
+  changePct: number | null;
+}
+
+export interface FundFlowForecastResult {
+  horizonDays: 5 | 10;
+  latest: FundFlowBar;
+  sum5: number;
+  sum10: number;
+  sum20: number;
+  retailSum5: number;
+  streakDays: number;
+  autocorrLag1: number;
+  ema5: number;
+  ema15: number;
+  predictedTotalNet: number;
+  predictedLowerNet: number;
+  predictedUpperNet: number;
+  inflowProbPct: number;
+  forecastRegime: 'strong_inflow' | 'mild_inflow' | 'balanced' | 'mild_outflow' | 'strong_outflow';
+  forecastLabel: string;
+  divergenceType:
+    | 'bull_divergence'
+    | 'bear_divergence'
+    | 'institutional_accumulation'
+    | 'institutional_distribution'
+    | 'aligned_inflow'
+    | 'aligned_outflow';
+  divergenceLabel: string;
+  divergenceDetail: string;
+  chartPoints: FundFlowChartPoint[];
+}
+
+

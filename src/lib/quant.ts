@@ -10,6 +10,8 @@ import type {
   EnrichedOptionContract,
   ForecastModelMode,
   ForecastPoint,
+  GreeksCurvePoint,
+  GreeksCurveSimulation,
   IndicatorBar,
   OhlcvBar,
   OptionRight,
@@ -20,6 +22,13 @@ import type {
   RawOptionContract,
   StockForecastResult,
   TechnicalSignals,
+  VolatilityCalendarDay,
+  VolatilityCalendarMetric,
+  VolatilityCalendarReport,
+  VolatilityCalendarWeek,
+  FundFlowBar,
+  FundFlowChartPoint,
+  FundFlowForecastResult,
 } from '../types/trading';
 
 /**
@@ -574,6 +583,113 @@ export function simulatePayoffCurves(params: {
   const maxLossUsd = entryPremium * multiplier;
 
   return { grid, breakeven, maxLossUsd };
+}
+
+export function simulateGreeksCurves(params: {
+  spot: number;
+  strike: number;
+  dte: number;
+  iv: number;
+  right: OptionRight;
+  riskFreeRate?: number;
+}): GreeksCurveSimulation {
+  const {
+    spot,
+    strike,
+    dte,
+    iv,
+    right,
+    riskFreeRate = 0.043,
+  } = params;
+
+  const safeSpot = Math.max(0.01, spot);
+  const safeDte = Math.max(1, dte);
+  const nearDte = Math.max(1, Math.min(safeDte - 1, Math.max(2, Math.floor(safeDte * 0.25))));
+  const minSpot = Math.max(0.01, Math.min(safeSpot, strike) * 0.72);
+  const maxSpot = Math.max(safeSpot, strike) * 1.28;
+  const steps = 64;
+
+  const rawPoints: Array<{
+    spot: number;
+    delta: number;
+    gamma: number;
+    thetaPerDay: number;
+    deltaNear: number;
+    gammaNear: number;
+    thetaNear: number;
+  }> = [];
+
+  let peakGamma = 0;
+  let peakGammaSpot = strike;
+  let peakAbsTheta = 0;
+  let peakThetaSpot = strike;
+
+  for (let i = 0; i <= steps; i++) {
+    const s = Number((minSpot + ((maxSpot - minSpot) * i) / steps).toFixed(2));
+    const cur = bsOptionGreeks({
+      spot: s,
+      strike,
+      timeYears: safeDte / 365,
+      riskFreeRate,
+      iv,
+      right,
+    });
+    const near = bsOptionGreeks({
+      spot: s,
+      strike,
+      timeYears: nearDte / 365,
+      riskFreeRate,
+      iv,
+      right,
+    });
+
+    if (cur.gamma > peakGamma) {
+      peakGamma = cur.gamma;
+      peakGammaSpot = s;
+    }
+    if (Math.abs(cur.thetaPerDay) > peakAbsTheta) {
+      peakAbsTheta = Math.abs(cur.thetaPerDay);
+      peakThetaSpot = s;
+    }
+
+    rawPoints.push({
+      spot: s,
+      delta: cur.delta,
+      gamma: cur.gamma,
+      thetaPerDay: cur.thetaPerDay,
+      deltaNear: near.delta,
+      gammaNear: near.gamma,
+      thetaNear: near.thetaPerDay,
+    });
+  }
+
+  const atSpot = bsOptionGreeks({
+    spot: safeSpot,
+    strike,
+    timeYears: safeDte / 365,
+    riskFreeRate,
+    iv,
+    right,
+  });
+
+  const points: GreeksCurvePoint[] = rawPoints.map((pt) => ({
+    ...pt,
+    absDeltaPct: Math.abs(pt.delta) * 100,
+    gammaNormPct: peakGamma > 0 ? (pt.gamma / peakGamma) * 100 : 0,
+    thetaNormPct: peakAbsTheta > 0 ? (Math.abs(pt.thetaPerDay) / peakAbsTheta) * 100 : 0,
+  }));
+
+  return {
+    points,
+    nearDte,
+    spotDelta: atSpot.delta,
+    spotGamma: atSpot.gamma,
+    spotThetaPerDay: atSpot.thetaPerDay,
+    peakGamma,
+    peakGammaSpot,
+    peakAbsTheta,
+    peakThetaSpot,
+  };
 }
 
 export function calcDaysLeft(dateStr: string): number | null {
@@ -1287,3 +1403,427 @@ export function computeAtrAnomalyReport(
     series: validPoints.slice(-windowDays),
   };
 }
+
+function parseUtcDateMs(dateStr: string): number {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return Date.UTC(y, (m || 1) - 1, d || 1);
+}
+
+function formatUtcDateStr(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+function quantileSorted(sorted: number[], q: number): number {
+  if (sorted.length === 0) return 0;
+  const idx = (sorted.length - 1) * q;
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+}
+
+export function computeVolatilityCalendar(
+  indicatorBars: IndicatorBar[],
+  liveAtmIv: number | null,
+  metricMode: VolatilityCalendarMetric = 'est_iv'
+): VolatilityCalendarReport | null {
+  if (!indicatorBars || indicatorBars.length < 25) return null;
+
+  const sortedBars = [...indicatorBars].sort((a, b) => a.date.localeCompare(b.date));
+  const latestBar = sortedBars[sortedBars.length - 1];
+  const currentHv20 = latestBar.hv20;
+
+  let ivToHvRatio = 1.0;
+  if (
+    liveAtmIv !== null &&
+    Number.isFinite(liveAtmIv) &&
+    liveAtmIv > 0 &&
+    currentHv20 !== null &&
+    currentHv20 > 1
+  ) {
+    ivToHvRatio = Math.min(1.85, Math.max(0.65, liveAtmIv / currentHv20));
+  }
+
+  const barMap = new Map<
+    string,
+    {
+      close: number;
+      dailyReturnPct: number | null;
+      hv20: number | null;
+      estimatedIv: number | null;
+      isLiveAnchor: boolean;
+    }
+  >();
+
+  for (let i = 0; i < sortedBars.length; i++) {
+    const b = sortedBars[i];
+    const prev = i > 0 ? sortedBars[i - 1] : null;
+    const retPct =
+      prev && prev.close > 0 ? ((b.close - prev.close) / prev.close) * 100 : null;
+    const isLatest = i === sortedBars.length - 1;
+    const estIv =
+      isLatest && liveAtmIv !== null && Number.isFinite(liveAtmIv) && liveAtmIv > 0
+        ? liveAtmIv
+        : b.hv20 !== null
+          ? b.hv20 * ivToHvRatio
+          : null;
+    barMap.set(b.date, {
+      close: b.close,
+      dailyReturnPct: retPct,
+      hv20: b.hv20,
+      estimatedIv: estIv,
+      isLiveAnchor: isLatest && liveAtmIv !== null && liveAtmIv > 0,
+    });
+  }
+
+  const latestMs = parseUtcDateMs(latestBar.date);
+  const latestDt = new Date(latestMs);
+  const sixMonthsStartMs = Date.UTC(
+    latestDt.getUTCFullYear(),
+    latestDt.getUTCMonth() - 6,
+    latestDt.getUTCDate()
+  );
+
+  // Align grid start to Monday
+  const startDt = new Date(sixMonthsStartMs);
+  const startDay = startDt.getUTCDay(); // 0=Sun..6=Sat
+  const shiftToMon = startDay === 0 ? -6 : 1 - startDay;
+  const gridStartMs = sixMonthsStartMs + shiftToMon * 86_400_000;
+
+  // Align grid end to Friday of latest bar's week
+  const latestDay = latestDt.getUTCDay();
+  const shiftToFri = latestDay === 0 ? -2 : latestDay === 6 ? -1 : 5 - latestDay;
+  const gridEndMs = latestMs + shiftToFri * 86_400_000;
+
+  // Collect values inside the 6M window for percentile ranking
+  const windowValues: number[] = [];
+  for (let ms = sixMonthsStartMs; ms <= latestMs; ms += 86_400_000) {
+    const dStr = formatUtcDateStr(ms);
+    const rec = barMap.get(dStr);
+    if (!rec) continue;
+    const val = metricMode === 'est_iv' ? rec.estimatedIv : rec.hv20;
+    if (val !== null && Number.isFinite(val)) {
+      windowValues.push(val);
+    }
+  }
+
+  if (windowValues.length < 15) return null;
+
+  const sortedVals = [...windowValues].sort((a, b) => a - b);
+  const minVal = sortedVals[0];
+  const maxVal = sortedVals[sortedVals.length - 1];
+  const medianVal = quantileSorted(sortedVals, 0.5);
+  const lowVolThreshold = quantileSorted(sortedVals, 0.25);
+  const highVolThreshold = quantileSorted(sortedVals, 0.7);
+
+  const calcPercentile = (val: number | null): number | null => {
+    if (val === null || !Number.isFinite(val)) return null;
+    const belowOrEq = sortedVals.filter((v) => v <= val).length;
+    return (belowOrEq / sortedVals.length) * 100;
+  };
+
+  const weeks: VolatilityCalendarWeek[] = [];
+  let tradingDayCount = 0;
+  let latestTradingDay: VolatilityCalendarDay | null = null;
+  let lastLabeledMonth = '';
+
+  let curDays: VolatilityCalendarDay[] = [];
+  let weekStartStr = '';
+
+  for (let ms = gridStartMs; ms <= gridEndMs; ms += 86_400_000) {
+    const dt = new Date(ms);
+    const dow = dt.getUTCDay(); // 0=Sun..6=Sat
+    if (dow === 0 || dow === 6) continue;
+
+    const dateStr = formatUtcDateStr(ms);
+    if (dow === 1) {
+      curDays = [];
+      weekStartStr = dateStr;
+    }
+
+    const isFutureInWeek = ms > latestMs;
+    const rec = isFutureInWeek ? undefined : barMap.get(dateStr);
+    const val = rec
+      ? metricMode === 'est_iv'
+        ? rec.estimatedIv
+        : rec.hv20
+      : null;
+
+    if (rec && val !== null) {
+      tradingDayCount += 1;
+    }
+
+    const dayObj: VolatilityCalendarDay = {
+      date: dateStr,
+      weekday: dow,
+      isTradingDay: Boolean(rec),
+      isFutureInWeek,
+      close: rec?.close ?? null,
+      dailyReturnPct: rec?.dailyReturnPct ?? null,
+      hv20: rec?.hv20 ?? null,
+      estimatedIv: rec?.estimatedIv ?? null,
+      value: val,
+      isLiveAnchor: Boolean(rec?.isLiveAnchor),
+      percentile6M: calcPercentile(val),
+    };
+
+    if (rec && val !== null) {
+      latestTradingDay = dayObj;
+    }
+
+    curDays.push(dayObj);
+
+    if (dow === 5 && curDays.length === 5) {
+      // Determine concise month header label when a new month starts in this week
+      let monthLabel: string | null = null;
+      const firstNewMonthDay = curDays.find((d) => {
+        const ym = d.date.slice(0, 7);
+        return ym !== lastLabeledMonth;
+      });
+      if (firstNewMonthDay) {
+        const ym = firstNewMonthDay.date.slice(0, 7);
+        const mNum = parseInt(firstNewMonthDay.date.slice(5, 7), 10);
+        const yNum = firstNewMonthDay.date.slice(2, 4);
+        monthLabel = mNum === 1 || lastLabeledMonth === '' ? `${yNum}/${mNum}月` : `${mNum}月`;
+        lastLabeledMonth = ym;
+      }
+
+      weeks.push({
+        weekStart: weekStartStr,
+        monthLabel,
+        days: curDays,
+      });
+    }
+  }
+
+  const currentValue = latestTradingDay?.value ?? null;
+  const currentPercentile = latestTradingDay?.percentile6M ?? null;
+
+  let entrySignal: 'buyer' | 'neutral' | 'seller' = 'neutral';
+  let entryHeadline = '波动中性区间 · 顺势择时';
+  let entryGuidance =
+    '当前波动处于近6个月常态中枢，买卖方均无极端定价偏差；建议沿正股主趋势搭配垂直价差降低时间损耗。';
+
+  if (currentPercentile !== null && currentPercentile <= 30) {
+    entrySignal = 'buyer';
+    entryHeadline = '低波买方甜点 · 权利金折价';
+    entryGuidance = `当前读数处于近6个月 ${currentPercentile.toFixed(0)}% 低分位（≤${lowVolThreshold.toFixed(1)}% 甜点区），隐含波动率成本低廉，适合买入 Call / Put 或借方价差捕捉趋势爆发与 Vega 扩张。`;
+  } else if (currentPercentile !== null && currentPercentile >= 70) {
+    entrySignal = 'seller';
+    entryHeadline = '高波卖方窗口 · 权利金溢价';
+    entryGuidance = `当前读数处于近6个月 ${currentPercentile.toFixed(0)}% 高分位（≥${highVolThreshold.toFixed(1)}% 高波区），单买期权易受 IV 回落侵蚀；更适合卖出备兑 Call、现金担保 Put 或高胜率贷方价差收租。`;
+  }
+
+  return {
+    startDate: formatUtcDateStr(sixMonthsStartMs),
+    endDate: latestBar.date,
+    metricMode,
+    weeks,
+    tradingDayCount,
+    currentHv20,
+    liveAtmIv,
+    currentValue,
+    ivToHvRatio,
+    minVal,
+    medianVal,
+    maxVal,
+    currentPercentile,
+    lowVolThreshold,
+    highVolThreshold,
+    entrySignal,
+    entryHeadline,
+    entryGuidance,
+    latestTradingDay,
+  };
+}
+
+export function computeFundFlowForecast(
+  rawBars: FundFlowBar[],
+  horizonDays: 5 | 10 = 5
+): FundFlowForecastResult | null {
+  if (!rawBars || rawBars.length < 10) return null;
+
+  const bars = [...rawBars].sort((a, b) => a.date.localeCompare(b.date));
+  const n = bars.length;
+  const latest = bars[n - 1];
+  const mainSeries = bars.map((b) => b.mainNet);
+
+  const sumLast = (k: number) =>
+    bars.slice(Math.max(0, n - k)).reduce((s, b) => s + b.mainNet, 0);
+
+  const sum5 = sumLast(5);
+  const sum10 = sumLast(10);
+  const sum20 = sumLast(20);
+  const retailSum5 = bars
+    .slice(Math.max(0, n - 5))
+    .reduce((s, b) => s + b.smallNet + b.mediumNet, 0);
+
+  // Consecutive inflow/outflow streak
+  const latestSign = latest.mainNet >= 0 ? 1 : -1;
+  let streakCount = 0;
+  for (let i = n - 1; i >= 0; i--) {
+    const sign = bars[i].mainNet >= 0 ? 1 : -1;
+    if (sign === latestSign) streakCount++;
+    else break;
+  }
+  const streakDays = streakCount * latestSign;
+
+  // Mean, std, EMA5, EMA15, and lag-1 autocorrelation
+  const mean60 = mainSeries.reduce((a, b) => a + b, 0) / n;
+  const variance =
+    mainSeries.reduce((acc, v) => acc + (v - mean60) ** 2, 0) / Math.max(1, n - 1);
+  const std60 = Math.sqrt(variance);
+
+  const ema5Arr = calcEmaSeries(mainSeries, 5);
+  const ema15Arr = calcEmaSeries(mainSeries, 15);
+  const ema5 = ema5Arr[ema5Arr.length - 1] ?? mean60;
+  const ema15 = ema15Arr[ema15Arr.length - 1] ?? mean60;
+
+  let cov1 = 0;
+  let var1 = 0;
+  for (let i = 1; i < n; i++) {
+    cov1 += (mainSeries[i] - mean60) * (mainSeries[i - 1] - mean60);
+    var1 += (mainSeries[i - 1] - mean60) ** 2;
+  }
+  const rawRho = var1 > 0 ? cov1 / var1 : 0;
+  const autocorrLag1 = Math.max(-0.65, Math.min(0.75, rawRho));
+
+  // AR(1) momentum-reversion forecast toward EMA15/Mean60 structural baseline
+  const phi = Math.max(0.28, Math.min(0.82, 0.48 + autocorrLag1 * 0.45));
+  const drift = ema15 * 0.45 + mean60 * 0.55;
+  const y0 = latest.mainNet * 0.35 + ema5 * 0.65;
+
+  const histTail = bars.slice(Math.max(0, n - 25));
+  const chartPoints: FundFlowChartPoint[] = [];
+  let runningCum = 0;
+
+  for (const b of histTail) {
+    runningCum += b.mainNet;
+    chartPoints.push({
+      label: b.date.slice(5), // MM-DD
+      isForecast: false,
+      histMainNet: b.mainNet,
+      forecastMainNet: null,
+      forecastLower: null,
+      forecastRange: null,
+      cumulativeMainNet: runningCum,
+      superLargeNet: b.superLargeNet,
+      largeNet: b.largeNet,
+      mediumNet: b.mediumNet,
+      smallNet: b.smallNet,
+      mainPct: b.mainPct,
+      close: b.close,
+      changePct: b.changePct,
+    });
+  }
+
+  let predictedTotalNet = 0;
+  let cumVar = 0;
+  let phiPowerSum = 0;
+
+  for (let h = 1; h <= horizonDays; h++) {
+    const phiH = Math.pow(phi, h);
+    const predDaily = drift + phiH * (y0 - drift);
+    phiPowerSum += Math.pow(phi, 2 * (h - 1));
+    const stepStd = std60 * Math.sqrt(phiPowerSum);
+    const bandWidth = 0.8416 * stepStd; // P20-P80 core band
+
+    predictedTotalNet += predDaily;
+    runningCum += predDaily;
+    cumVar += stepStd ** 2;
+
+    chartPoints.push({
+      label: `T+${h}`,
+      isForecast: true,
+      histMainNet: null,
+      forecastMainNet: predDaily,
+      forecastLower: predDaily - bandWidth,
+      forecastRange: [predDaily - bandWidth, predDaily + bandWidth],
+      cumulativeMainNet: runningCum,
+      superLargeNet: null,
+      largeNet: null,
+      mediumNet: null,
+      smallNet: null,
+      mainPct: null,
+      close: null,
+      changePct: null,
+    });
+  }
+
+  const cumStd = Math.max(1e-6, Math.sqrt(cumVar));
+  const predictedLowerNet = predictedTotalNet - 0.8416 * cumStd;
+  const predictedUpperNet = predictedTotalNet + 0.8416 * cumStd;
+  const inflowProbPct = Math.max(8, Math.min(92, normCdf(predictedTotalNet / cumStd) * 100));
+
+  let forecastRegime: FundFlowForecastResult['forecastRegime'] = 'balanced';
+  let forecastLabel = '多空资金均衡拉锯';
+  if (inflowProbPct >= 66) {
+    forecastRegime = 'strong_inflow';
+    forecastLabel = '主力资金持续净流入预期';
+  } else if (inflowProbPct >= 55) {
+    forecastRegime = 'mild_inflow';
+    forecastLabel = '温和吸筹 · 偏净流入预期';
+  } else if (inflowProbPct <= 34) {
+    forecastRegime = 'strong_outflow';
+    forecastLabel = '主力资金连续净流出预警';
+  } else if (inflowProbPct <= 45) {
+    forecastRegime = 'mild_outflow';
+    forecastLabel = '资金承压 · 偏净流出预期';
+  }
+
+  // Smart-money vs retail & price divergence check over last 5 days
+  const refBar5 = bars[Math.max(0, n - 6)];
+  const price5Pct =
+    refBar5 && refBar5.close > 0 ? ((latest.close - refBar5.close) / refBar5.close) * 100 : 0;
+
+  let divergenceType: FundFlowForecastResult['divergenceType'] =
+    sum5 >= 0 ? 'aligned_inflow' : 'aligned_outflow';
+  let divergenceLabel = sum5 >= 0 ? '主力顺势净流入' : '主力顺势净流出';
+  let divergenceDetail =
+    sum5 >= 0
+      ? `近5日主力累计净流入，与当前量价节奏保持同向共振。`
+      : `近5日主力整体呈现净流出，短线资金承接偏弱。`;
+
+  if (price5Pct <= -1.2 && sum5 > 0) {
+    divergenceType = 'bull_divergence';
+    divergenceLabel = '下跌缩量/低位吸筹背离';
+    divergenceDetail = `近5日股价回调 ${price5Pct.toFixed(1)}%，但主力逆势净流入，存在机构逢低吸筹特征。`;
+  } else if (price5Pct >= 1.2 && sum5 < 0) {
+    divergenceType = 'bear_divergence';
+    divergenceLabel = '拉高派发顶背离警示';
+    divergenceDetail = `近5日股价上涨 +${price5Pct.toFixed(1)}%，但主力净流出且中小单承接，需警惕冲高派发。`;
+  } else if (sum5 > 0 && retailSum5 < 0) {
+    divergenceType = 'institutional_accumulation';
+    divergenceLabel = '机构吸筹 · 散户流出';
+    divergenceDetail = `近5日超大单/大单持续净买入，散户筹码向大资金集中。`;
+  } else if (sum5 < 0 && retailSum5 > 0) {
+    divergenceType = 'institutional_distribution';
+    divergenceLabel = '主力撤离 · 散户接盘';
+    divergenceDetail = `近5日主力净流出而中小单净买入，筹码分散不利于快速拉升。`;
+  }
+
+  return {
+    horizonDays,
+    latest,
+    sum5,
+    sum10,
+    sum20,
+    retailSum5,
+    streakDays,
+    autocorrLag1,
+    ema5,
+    ema15,
+    predictedTotalNet,
+    predictedLowerNet,
+    predictedUpperNet,
+    inflowProbPct,
+    forecastRegime,
+    forecastLabel,
+    divergenceType,
+    divergenceLabel,
+    divergenceDetail,
+    chartPoints,
+  };
+}
+
+

@@ -9,6 +9,7 @@ import {
 import type {
   EnrichedOptionContract,
   GlobalRiskConfig,
+  IndicatorBar,
   LedgerEntry,
   OptionRight,
   OptionsChainResponse,
@@ -16,6 +17,8 @@ import type {
   ToastType,
 } from '../types/trading';
 import { OptionPayoffChart } from './Charts';
+import { OptionGreeksCurvesPanel } from './OptionGreeksCurvesPanel';
+import { VolatilityCalendarHeatmap } from './VolatilityCalendarHeatmap';
 
 interface OptionsLabViewProps {
   riskConfig: GlobalRiskConfig;
@@ -40,6 +43,7 @@ export const OptionsLabView: React.FC<OptionsLabViewProps> = ({
 
   const [chainData, setChainData] = useState<OptionsChainResponse | null>(null);
   const [selectedExpiry, setSelectedExpiry] = useState<string>('');
+  const [indicatorBars, setIndicatorBars] = useState<IndicatorBar[]>([]);
   const [hv20, setHv20] = useState<number | null>(null);
   const [hvRank, setHvRank] = useState<number | null>(null);
 
@@ -109,10 +113,12 @@ export const OptionsLabView: React.FC<OptionsLabViewProps> = ({
         if (histRes.ok) {
           const histJson = (await histRes.json()) as StockHistoryResponse;
           const ind = computeIndicators(histJson.bars);
+          setIndicatorBars(ind);
           const last = ind[ind.length - 1];
           setHv20(last?.hv20 ?? null);
           setHvRank(last?.hvRank ?? null);
         } else {
+          setIndicatorBars([]);
           setHv20(null);
           setHvRank(null);
         }
@@ -472,6 +478,13 @@ export const OptionsLabView: React.FC<OptionsLabViewProps> = ({
             </div>
           </div>
 
+          {/* 6-Month Volatility Calendar Heatmap */}
+          <VolatilityCalendarHeatmap
+            symbol={chainData.symbol}
+            indicatorBars={indicatorBars}
+            liveAtmIv={atmIvPct}
+          />
+
           {/* Option Chain Grid */}
           <div className="rounded-lg border border-slate-800 bg-[#0F172A] overflow-hidden">
             <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3 border-b border-slate-800">
@@ -791,6 +804,20 @@ export const OptionsLabView: React.FC<OptionsLabViewProps> = ({
                 )}
               </div>
             </div>
+          )}
+
+          {/* Recharts Delta / Gamma / Theta Nonlinear Risk Curves */}
+          {selectedContract && (
+            <OptionGreeksCurvesPanel
+              symbol={chainData.symbol}
+              spotPrice={chainData.spotPrice}
+              strike={selectedStrike || selectedContract.strike}
+              dte={selectedContract.dte}
+              ivPct={selectedContract.ivPct}
+              right={right}
+              contracts={contracts}
+              expiryDate={chainData.selectedExpiry}
+            />
           )}
         </>
       )}

@@ -196,7 +196,9 @@ export const HomeOverviewView: React.FC<HomeOverviewViewProps> = ({
         const alertQuotes: AlertPriceQuote[] = [];
 
         for (const r of json.results || []) {
-          const key = `${r.market}:${r.symbol}`;
+          const mktKey = r.market ?? r.data?.market ?? '';
+          const symKey = r.symbol ?? r.data?.symbol ?? '';
+          const key = `${mktKey}:${symKey}`;
           dataByKey.set(key, r);
           if (r.ok && r.data && r.data.bars.length > 0) {
             const d = r.data;
